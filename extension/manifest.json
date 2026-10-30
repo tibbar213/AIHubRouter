@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "AIHubRouter · 模型渠道优选",
+  "version": "0.3.5",
+  "description": "为每个指定模型的 key 独立监控价格与健康状态，按价格、延迟或成功率选择合格首选分组。",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "storage",
+    "alarms",
+    "notifications",
+    "webRequest",
+    "sidePanel",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://aihub.top/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开 AIHubRouter",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "128": "icon.png"
+  },
+  "side_panel": {
+    "default_path": "options.html"
+  }
+}
