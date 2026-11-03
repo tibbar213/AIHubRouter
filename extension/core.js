@@ -1,4 +1,4 @@
-export const PLATFORMS = ['openai','kimi','zhipu','grok','deepseek'];
+export const PLATFORMS = ['openai','kimi','zhipu','grok','deepseek','gemini'];
 export const INTERVAL = 300000;
 export const PRICE_SOURCE = 'platform-effective-price-v1';
 export const DEFAULT_RULES=Object.freeze({minSuccess:0,minSamples:0,maxLatency:0,maxPrice:0,maxRate:0,allowIds:Object.freeze([]),denyIds:Object.freeze([]),confirmRounds:1,cooldownMinutes:0,minImprovement:0});
@@ -19,7 +19,7 @@ export function detectionInfo(group,model){
   const d=group.model_detection;
   if(!d || d.model!==model)return {passed:false,label:d?.model?'检测的是其他模型':'未检测绑定模型'};
   const matchingStages=['detection','text'].every(k=>!d.stages?.[k]?.model || d.stages[k].model===model);
-  const passed=d.status==='passed' && d.applicable===true && d.execution_complete===true && matchingStages;
+  const passed=d.status==='passed' && d.applicable!==false && d.execution_complete!==false && matchingStages;
   return {passed,label:passed?'检测通过':({suspected:'存疑',detection_failed:'检测失败',not_tested:'未检测'})[d.status]||'检测未通过或未完成'};
 }
 export function strategyLabel(strategy) {
@@ -29,19 +29,26 @@ export function strategyLabel(strategy) {
   return `加权：价格 ${(s.weights.price/total*100).toFixed(1)}% · 延迟 ${(s.weights.latency/total*100).toFixed(1)}% · 成功率 ${(s.weights.success/total*100).toFixed(1)}%`;
 }
 const validPrice = x => typeof x === 'number' && Number.isFinite(x) && x >= 0;
-export function platformPrice(group, model) {
+export function platformPrice(group, model, now=Date.now()) {
   // Match ProviderHall's selected-model projection and effectivePrice sort.
   // The predicted multiplier is a companion display value, never another price unit.
   const summary = group.summary_models?.[model];
-  if (!summary || !validPrice(summary.effective_input_price_per_million)) return null;
+  if (!summary) return null;
   if (summary.range_cache?.stale === true || summary.range_cache?.ready === false) return null;
+  if (!validPrice(summary.effective_input_price_per_million)) {
+    const cache=summary.range_cache, p=cache?.pricing_models?.[model], publicRate=group.public_rate_multiplier??group.rate_multiplier;
+    const refreshed=Date.parse(cache?.refreshed_at);
+    if(group.platform!=='grok'||model!=='grok-4.7'||summary.effective_multiplier_reason!=='insufficient_samples'||cache?.ready!==true||cache?.coverage_complete!==true||cache?.stale!==false||!Number.isFinite(refreshed)||now-refreshed>INTERVAL||refreshed>now+60000||!p||!Number.isSafeInteger(p.usage_records)||p.usage_records<=0||!validPrice(p.sol_equivalent_unit_price)||!validPrice(publicRate)||!validPrice(group.rate_multiplier)||publicRate!==group.rate_multiplier||p.unknown_context_records!==0||p.long_input_tokens!==0||p.long_cache_read_tokens!==0||p.long_cache_creation_tokens!==0)return null;
+    const cost=p.sol_equivalent_unit_price*publicRate;
+    return validPrice(cost)?{cost,predictedMultiplier:null,estimated:true,sampleCount:p.usage_records}:null;
+  }
   return {
     cost: summary.effective_input_price_per_million,
     predictedMultiplier: summary.effective_multiplier_ready === true && validPrice(summary.effective_multiplier) ? summary.effective_multiplier : null
   };
 }
 export function migrateApp(app) {
-  if (app.schemaVersion === 6) return false;
+  if (app.schemaVersion === 7) return false;
   const previousVersion=app.schemaVersion;
   delete app.pricing;
   for (const c of app.configs) delete c.profile;
@@ -49,18 +56,19 @@ export function migrateApp(app) {
   app.checkMinutes=app.checkMinutes||5;
   for (const c of app.configs) c.strategy=c.strategy ? validateStrategy(c.strategy) : null;
   if(previousVersion===5){app.defaultStrategy.rules.confirmRounds=1;for(const c of app.configs)if(c.strategy)c.strategy.rules.confirmRounds=1;}
+  if(previousVersion===6)for(const c of app.configs){const s=app.states[c.keyId];if(s&&!s.pending&&c.paused&&/^(检测到外部改组|切换前发现外部改组|检测到页面改组操作|切换期间发生外部改组)，已暂停$/.test(s.status||''))c.paused=false;}
   for (const s of Object.values(app.states)) {
     s.candidate=null; s.count=0;
     delete s.observedAt; delete s.choices; delete s.excluded;
     s.status=s.pending?'等待核实上次切换':'排序策略已更新，等待重新检查';
   }
-  app.schemaVersion=6;
+  app.schemaVersion=7;
   return true;
 }
 export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) {
   strategy=validateStrategy(strategy);
   const rules=strategy.rules;
-  if (!group || !PLATFORMS.includes(group.platform) || group.platform!==config.platform) return {reason:'模型系列不匹配'};
+  if (!group || typeof group.platform!=='string' || group.platform!==config.platform) return {reason:'模型系列不匹配'};
   if (snapshot.stale!==false || !Number.isFinite(Date.parse(snapshot.generated_at)) || now-Date.parse(snapshot.generated_at)>INTERVAL || Date.parse(snapshot.generated_at)>now+60000) return {reason:'价格快照未知或过期'};
   if (group.available!==true || group.availability_unknown===true || group.probe_state!=='enabled' || group.probe_skipped===true) return {reason:'分组不可用或未探测'};
   if (group.bindable===false) return {reason:'当前账号不可绑定'};
@@ -77,7 +85,7 @@ export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) 
   const detection=detectionInfo(group,config.model);
   if(strategy.requireDetection!==false && !detection.passed)return {reason:detection.label};
   if (group.subscription_type!=='standard') return {reason:'非按量分组'};
-  const metric=platformPrice(group,config.model);
+  const metric=platformPrice(group,config.model,now);
   const summary=group.summary_models?.[config.model];
   const samples=validPrice(summary?.sample_count)&&Number.isInteger(summary.sample_count)?summary.sample_count:null;
   const latency=samples>0 && validPrice(summary.user_latency_ms) ? summary.user_latency_ms : null;
@@ -90,7 +98,7 @@ export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) 
   const required=strategy.mode==='weighted' ? Object.keys(strategy.weights).filter(k=>strategy.weights[k]>0) : [strategy.mode];
   const missing=required.find(k=>metrics[k]===null);
   if(missing)return {reason:{price:'指定模型真实价格缺失或未就绪',latency:'指定模型首响应延迟缺失或无样本',success:'指定模型成功率缺失或无样本'}[missing]};
-  return {cost:metrics.price,predictedMultiplier:metric?.predictedMultiplier??null,latency,success,metrics,detection:detection.label};
+  return {cost:metrics.price,predictedMultiplier:metric?.predictedMultiplier??null,estimated:metric?.estimated===true,priceSamples:metric?.sampleCount??null,latency,success,metrics,detection:detection.label};
 }
 export function rankChoices(choices,strategy) {
   const s=validateStrategy(strategy);
@@ -110,12 +118,12 @@ export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),g
   const reset=(status)=>({state:{...next,candidate:null,count:0,status},target:null});
   if (config.paused) return reset('已暂停');
   if (state.pending) return reset('等待核实上次切换');
-  if (state.expectedGroupId!=null && state.expectedGroupId!==currentGroupId) return {target:null,pause:true,state:{...next,candidate:null,count:0,status:'检测到外部改组，已暂停'}};
+  if (state.expectedGroupId!=null && state.expectedGroupId!==currentGroupId) return {target:null,externalChange:true,state:{...next,expectedGroupId:currentGroupId,observedGroupId:undefined,candidate:null,count:0,observedAt:undefined,status:'检测到分组变化，已更新并等待下轮检查'}};
   next.expectedGroupId=currentGroupId;
   const assessed=(snapshot.items||[]).filter(g=>g.platform===config.platform).map(g=>({group:g,...assess(g,config,snapshot,now,strategy)}));
   next.excluded=Object.fromEntries([...new Set(assessed.filter(x=>x.reason).map(x=>x.reason))].map(reason=>[reason,assessed.filter(x=>x.reason===reason).length]));
   const choices=rankChoices(assessed.filter(x=>!x.reason),strategy);
-  next.choices=choices.map(x=>({id:x.group.group_id,code:x.group.code||String(x.group.group_id),cost:x.cost,predictedMultiplier:x.predictedMultiplier,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection}));
+  next.choices=choices.map(x=>({id:x.group.group_id,code:x.group.code||String(x.group.group_id),cost:x.cost,predictedMultiplier:x.predictedMultiplier,estimated:x.estimated,priceSamples:x.priceSamples,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection}));
   if (!choices.length) return {...reset('没有合格分组，保留当前'),notice:'no-candidate'};
   const current=choices.find(x=>x.group.group_id===currentGroupId), best=choices[0];
   if (current && current.score>=best.score-1e-9) return reset('当前分组已是策略最优（同分不切）');
@@ -136,5 +144,5 @@ export function reconcilePending(state,actual) {
   const {from,to}=state.pending;
   if (actual===to) return {state:{...state,pending:null,expectedGroupId:to,candidate:null,count:0,lastSwitchAt:Date.now(),status:'已确认切换成功'}};
   if (actual===from) return {pause:true,state:{...state,pending:null,expectedGroupId:from,candidate:null,count:0,status:'切换未生效，已暂停，请检查后恢复'}};
-  return {pause:true,state:{...state,pending:null,expectedGroupId:actual,candidate:null,count:0,status:'切换期间发生外部改组，已暂停'}};
+  return {state:{...state,pending:null,expectedGroupId:actual,candidate:null,count:0,status:'切换期间分组发生变化，等待下轮检查'}};
 }

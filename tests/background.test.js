@@ -19,7 +19,7 @@ async function boot({pending=false,automatic=true,auth=true}={}){
     else if(path==='/api/v1/keys')data={pages:1,items:[{id:7,name:'Fake key',key:'SECRET_KEY_MUST_NOT_PERSIST',status:'active',group_id:actual,max_rate_multiplier:0}]};
     else if(path==='/api/v1/groups/available')data=[1,2].map(id=>({id,rate_multiplier:id===1?1:.1,peak_rate_enabled:false,subscription_type:'standard'}));
     else if(path==='/api/v1/groups/rates')data=null;
-    else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date(now).toISOString(),items:[group(1),group(2)]};
+    else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date(now).toISOString(),items:[group(1),group(2),{...group(3),platform:'new-provider'}]};
     else if(path==='/api/v1/keys/7/group'){
       actual=JSON.parse(options.body).group_id;
       if(failWrite)throw new Error('simulated response lost');
@@ -45,7 +45,9 @@ test('lost mutation response journals intent then next cycle reads back without 
 test('pending unchanged group pauses instead of blindly retrying',async()=>{const b=await boot({pending:true});await b.send({type:'check'});assert.equal(b.local.app.configs[0].paused,true);assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);});
 test('account changes pause all configurations before reading keys or writing',async()=>{const b=await boot();b.setUser(99);await b.send({type:'check'});assert.equal(b.local.app.configs[0].paused,true);assert.equal(b.requests.length,1);});
 test('missing session is notified once across repeated polls',async()=>{const b=await boot({auth:false});await b.send({type:'check'});await b.send({type:'check'});assert.equal(b.notices.length,1);assert.equal(b.requests.length,0);});
-test('external group changes pause instead of overwriting',async()=>{const b=await boot();b.setActual(3);await b.send({type:'check'});assert.equal(b.local.app.configs[0].paused,true);assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);});
+test('external group changes update baseline without pausing or writing in same cycle',async()=>{const b=await boot();b.setActual(3);await b.send({type:'check'});assert.equal(b.local.app.configs[0].paused,false);assert.equal(b.local.app.states[7].expectedGroupId,3);assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);});
+test('detection toggle creates per-key strategy while preserving global settings',async()=>{const b=await boot();await b.send({type:'state'});await b.send({type:'toggleKey',keyId:7,field:'requireDetection',enabled:false});assert.equal(b.local.app.configs[0].strategy.requireDetection,false);assert.equal(b.local.app.defaultStrategy.requireDetection,true);});
+test('catalog and binding accept a newly introduced platform',async()=>{const b=await boot();const catalog=await b.send({type:'catalog'});assert.ok(catalog.result.models.some(m=>m.platform==='new-provider'&&m.model==='model-test'));const result=await b.send({type:'configure',keyId:7,platform:'new-provider',model:'model-test',automatic:false});assert.equal(result.error,undefined);});
 test('credentials are captured only from platform tab requests, not extension requests',async()=>{
   const b=await boot({auth:false});b.listeners.auth({tabId:-1,requestHeaders:[{name:'Authorization',value:'Bearer fake-extension'}]});
   await b.send({type:'state'});assert.equal(b.session.auth,undefined);

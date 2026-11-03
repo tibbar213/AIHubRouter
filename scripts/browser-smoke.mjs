@@ -5,7 +5,6 @@ import assert from 'node:assert/strict';
 await mkdir('work',{recursive:true});
 const profile=await mkdtemp(resolve('work/browser-smoke-'));
 await mkdir('outputs',{recursive:true});
-await mkdir('release-prep',{recursive:true});
 const extension=resolve('extension');
 console.log('Starting isolated Edge extension smoke test');
 const context=await chromium.launchPersistentContext(profile,{
@@ -29,7 +28,7 @@ try{
   assert.equal(await page.locator('#globalWeights').isVisible(),true);
   await page.locator('#globalPrice').fill('60');await page.locator('#globalLatency').fill('30');await page.locator('#globalSuccess').fill('10');
   await page.locator('#globalAdvanced summary').click();
-  assert.equal(await page.locator('#globalDetection').isChecked(),true);
+  assert.equal(await page.locator('#globalDetection, #keyDetection').count(),0);
   await page.locator('#globalMinSuccess').fill('90');
   await page.locator('#globalMinSamples').fill('10');
   await page.locator('#globalConfirmRounds').fill('3');
@@ -66,7 +65,7 @@ try{
   await page.getByRole('button',{name:'保存 key 配置',exact:true}).click();
   try { await page.getByRole('heading',{name:'gpt-example · Key 101',exact:true}).waitFor({timeout:5000}); } catch(e) { console.log('UI status:', await page.locator('#message').innerText()); console.log('Page errors:', errors); throw e; }
   await page.getByLabel('使用独立策略').check();
-  await page.getByText('当前分组 12 · 独立策略', {exact:false}).waitFor();
+  await page.getByText('最近确认分组 12 · 独立策略', {exact:false}).waitFor();
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByText('仅预览 · 预览：建议分组 24',{exact:true}).waitFor();
   assert.equal(await page.locator('.monitor details').first().evaluate(e=>e.open),false);
@@ -81,7 +80,7 @@ try{
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[]);
   await page.getByLabel('使用独立策略').uncheck();
   await page.getByLabel('自动改组').check();
-  await page.getByText('当前分组 12 · 继承全局', {exact:false}).waitFor();
+  await page.getByText('最近确认分组 12 · 继承全局', {exact:false}).waitFor();
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByText('自动切换 · 已确认切换成功',{exact:true}).waitFor();
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
