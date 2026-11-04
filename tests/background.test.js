@@ -27,6 +27,7 @@ async function boot({pending=false,automatic=true,auth=true}={}){
     }else throw new Error('Unexpected path '+path);
     return {ok:true,status:200,json:async()=>({code:0,data})};
   };
+  globalThis.chrome.tabs={query:async()=>[]};globalThis.chrome.scripting={executeScript:async()=>[]};
   await import(`../extension/background.js?test=${seq++}`);
   const send=message=>new Promise(resolve=>listeners.message(message,{id:'test-id',url:'chrome-extension://test-id/options.html'},resolve));
   return {send,local,session,listeners,requests,notices,setActual:n=>actual=n,setUser:n=>user=n,setStale:v=>stale=v,loseResponse:()=>failWrite=true};
@@ -99,6 +100,17 @@ test('catalog connects using an already-open logged-in site tab without waiting 
   const r=await b.send({type:'catalog'});
   assert.equal(r.error,undefined);assert.equal(r.result.keys[0].id,7);
   assert.equal(b.session.auth,'Bearer FAKE_SITE_TOKEN');assert.ok(!JSON.stringify(b.local).includes('FAKE_SITE_TOKEN'));
+});
+test('scheduled checks reconnect from an open site tab after session loss',async()=>{
+  const b=await boot({auth:false,automatic:false});await b.send({type:'check'});assert.match(b.local.app.lastError,/登录已失效/);
+  chrome.tabs.query=async()=>[{id:3}];chrome.scripting.executeScript=async()=>[{result:'RENEWED_TEST_SESSION'}];
+  await b.send({type:'check'});assert.equal(b.local.app.lastError,null);assert.equal(b.local.app.notices['read-AUTH'],undefined);assert.equal(b.session.auth,'Bearer RENEWED_TEST_SESSION');assert.equal(b.requests.filter(x=>x.method==='PUT').length,0);
+});
+test('expired cached credentials are replaced once and identity is rechecked',async()=>{
+  const b=await boot({automatic:false}),original=globalThis.fetch;let rejected=false;
+  globalThis.fetch=async(url,options)=>{if(new URL(url).pathname==='/api/v1/auth/me'&&!rejected){rejected=true;return {status:401,ok:false};}return original(url,options);};
+  chrome.tabs.query=async()=>[{id:3}];chrome.scripting.executeScript=async()=>[{result:'RENEWED_TEST_SESSION'}];
+  await b.send({type:'check'});assert.equal(b.local.app.lastError,null);assert.equal(b.session.auth,'Bearer RENEWED_TEST_SESSION');assert.equal(b.requests.filter(x=>x.method==='PUT').length,0);
 });
 test('catalog stops waiting and reports an error when browser tab lookup hangs',async()=>{
   const b=await boot({auth:false});

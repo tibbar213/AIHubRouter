@@ -17,10 +17,10 @@ export function validateStrategy(strategy) {
 }
 export function detectionInfo(group,model){
   const d=group.model_detection;
-  if(!d || d.model!==model)return {passed:false,label:d?.model?'检测的是其他模型':'未检测绑定模型'};
-  const matchingStages=['detection','text'].every(k=>!d.stages?.[k]?.model || d.stages[k].model===model);
-  const passed=d.status==='passed' && d.applicable!==false && d.execution_complete!==false && matchingStages;
-  return {passed,label:passed?'检测通过':({suspected:'存疑',detection_failed:'检测失败',not_tested:'未检测'})[d.status]||'检测未通过或未完成'};
+  if(!d)return {passed:false,label:'未检测'};
+  const passed=d.status==='passed' && d.applicable!==false && d.execution_complete!==false;
+  const label=passed?'检测通过':({suspected:'存疑',detection_failed:'检测失败',not_tested:'未检测'})[d.status]||'检测未通过或未完成';
+  return {passed,label:label+(d.model&&d.model!==model?`（检测 ${d.model}）`:'')};
 }
 export function strategyLabel(strategy) {
   const s=validateStrategy(strategy);
@@ -59,7 +59,7 @@ export function migrateApp(app) {
   if(previousVersion===6)for(const c of app.configs){const s=app.states[c.keyId];if(s&&!s.pending&&c.paused&&/^(检测到外部改组|切换前发现外部改组|检测到页面改组操作|切换期间发生外部改组)，已暂停$/.test(s.status||''))c.paused=false;}
   for (const s of Object.values(app.states)) {
     s.candidate=null; s.count=0;
-    delete s.observedAt; delete s.choices; delete s.excluded;
+    delete s.observedAt; delete s.choices; delete s.rateLimitedChoices; delete s.excludedChoices; delete s.excluded;
     s.status=s.pending?'等待核实上次切换':'排序策略已更新，等待重新检查';
   }
   app.schemaVersion=7;

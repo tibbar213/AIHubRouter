@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 await mkdir('work',{recursive:true});
 const profile=await mkdtemp(resolve('work/browser-smoke-'));
 await mkdir('outputs',{recursive:true});
+await mkdir('release-prep',{recursive:true});
 const extension=resolve('extension');
 console.log('Starting isolated Edge extension smoke test');
 const context=await chromium.launchPersistentContext(profile,{
@@ -22,7 +23,8 @@ try{
   await page.getByText('还没有监控。先连接平台，再绑定 key 和模型。').waitFor();
   assert.equal(await page.title(),'AIHubRouter');
   assert.equal(await page.locator('#ratio,#read,#write,#basis,#verified').count(),0);
-  await page.getByText('2 · 全局默认策略',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'配置',exact:true}).click();
+  await page.getByText('全局默认策略',{exact:true}).waitFor();
   assert.equal(await page.locator('#globalMode').inputValue(),'price');
   await page.locator('#globalMode').selectOption('weighted');
   assert.equal(await page.locator('#globalWeights').isVisible(),true);
@@ -35,21 +37,22 @@ try{
   await page.getByRole('button',{name:'保存全局策略',exact:true}).click();
   await page.getByText('已完成',{exact:true}).waitFor();
   assert.equal((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).defaultStrategy.weights.price,60);
+  await page.screenshot({path:'outputs/settings-preview.png',fullPage:true});
+  await page.getByRole('button',{name:'监控0',exact:true}).click();
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByText('已完成',{exact:true}).waitFor();
-  await page.screenshot({path:'outputs/settings-preview.png',fullPage:true});
   // Synthetic test data and requests are injected only into this isolated browser profile.
   await worker.evaluate(async()=>{
     await chrome.storage.session.set({auth:'Bearer TEST_ONLY_FAKE_SESSION'});
     let current=12;
     globalThis.testWrites=[];
-    globalThis.testAllHealthy=false;
+    globalThis.testAllHealthy=false;globalThis.testRateLimit=0;
     globalThis.fetch=async(url,options)=>{
       const path=new URL(url).pathname, expires=new Date(Date.now()+90000).toISOString();
       const price={input_per_million:2,cache_input_per_million:.1,cache_write_per_million:2.5,output_per_million:10};
       let data;
       if(path==='/api/v1/auth/me')data={id:999};
-      else if(path==='/api/v1/keys')data={pages:1,items:[{id:101,name:'测试用 key',status:'active',group_id:current,max_rate_multiplier:0,key:'MUST_NOT_LEAVE_TEST'}]};
+      else if(path==='/api/v1/keys')data={pages:1,items:[{id:101,name:'测试用 key',status:'active',group_id:current,max_rate_multiplier:globalThis.testRateLimit,key:'MUST_NOT_LEAVE_TEST'}]};
       else if(path==='/api/v1/groups/available')data=[12,24].map(id=>({id,rate_multiplier:1,peak_rate_enabled:false,subscription_type:'standard'}));
       else if(path==='/api/v1/groups/rates')data={24:.1};
       else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date().toISOString(),items:[12,24].map(id=>({group_id:id,code:'示例-'+id,platform:'openai',rate_multiplier:1,available:id===24||globalThis.testAllHealthy,probe_state:'enabled',probe_expires_at:expires,long_context_pricing_enabled:false,subscription_type:'standard',model_detection:{model:'gpt-example',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'gpt-example',price}],summary_models:{'gpt-example':{effective_input_price_per_million:id===12?1:.1,effective_multiplier:.05,effective_multiplier_ready:true,sample_count:100,user_latency_ms:id===12?1000:2000,success_rate:id===12?.95:.99}},model_cards:[{model:'gpt-example',health:'healthy',probe_state:'enabled',health_expires_at:expires}]}))};
@@ -58,6 +61,7 @@ try{
       return {ok:true,status:200,json:async()=>({code:0,data})};
     };
   });
+  await page.getByRole('button',{name:'配置',exact:true}).click();
   await page.getByRole('button',{name:'读取 key 与模型',exact:true}).click();
   await page.locator('#keyId option[value="101"]').waitFor({state:'attached'});
   await page.locator('#keyId').selectOption('101');
@@ -70,12 +74,25 @@ try{
   await page.getByText('仅预览 · 预览：建议分组 24',{exact:true}).waitFor();
   assert.equal(await page.locator('.monitor details').first().evaluate(e=>e.open),false);
   await page.locator('.monitor details summary').first().click();
-  assert.equal(await page.locator('table thead th').count(),9);
-  await page.getByRole('button',{name:'用户评分',exact:true}).click();
+  assert.equal(await page.locator('.candidate-details table thead th').count(),9);
+  await page.locator('.candidate-details').getByRole('button',{name:'用户评分',exact:true}).click();
   await page.setViewportSize({width:420,height:700});
-  assert.equal(await page.locator('.monitor thead').isVisible(),false);
-  assert.equal(await page.locator('.compact-sort select').isVisible(),true);
-  await page.locator('.compact-sort select').selectOption('cost:1');
+  assert.equal(await page.locator('.candidate-details thead').isVisible(),false);
+  assert.equal(await page.locator('.candidate-details .compact-sort select').isVisible(),true);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.screenshot({path:'outputs/monitor-sidebar.png',fullPage:true});
+  await page.setViewportSize({width:340,height:700});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.screenshot({path:'outputs/monitor-narrow.png',fullPage:true});
+  await page.emulateMedia({colorScheme:'dark'});
+  await page.screenshot({path:'outputs/monitor-dark.png',fullPage:true,animations:'disabled'});
+  assert.equal(await page.locator('#addKey').evaluate(e=>getComputedStyle(e).backgroundColor),'rgb(32, 43, 62)');
+  await page.emulateMedia({colorScheme:'light'});
+  await page.getByRole('button',{name:'配置',exact:true}).click();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.screenshot({path:'outputs/settings-narrow.png',fullPage:true,animations:'disabled'});
+  await page.getByRole('button',{name:'监控1',exact:true}).click();
+  await page.locator('.candidate-details .compact-sort select').selectOption('cost:1');
   await page.setViewportSize({width:1200,height:1000});
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[]);
   await page.getByLabel('使用独立策略').uncheck();
@@ -85,6 +102,13 @@ try{
   await page.getByText('自动切换 · 已确认切换成功',{exact:true}).waitFor();
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
   await worker.evaluate(()=>{globalThis.testAllHealthy=true;});
+  await worker.evaluate(()=>{globalThis.testRateLimit=.5;});
+  await page.getByRole('button',{name:'立即检查',exact:true}).click();
+  await page.locator('.exclusions summary').click();
+  await page.locator('.exclusions').getByText('超过此 key 的倍率上限',{exact:true}).waitFor();
+  assert.equal(await page.locator('.excluded-candidates').count(),0);
+  assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
+  await worker.evaluate(()=>{globalThis.testRateLimit=0;});
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByRole('button',{name:'切换到 示例-12',exact:true}).waitFor();
   await page.screenshot({path:'outputs/monitor-preview.png',fullPage:true});

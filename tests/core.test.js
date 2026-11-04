@@ -148,11 +148,19 @@ test('bad weights and unknown modes are rejected; omitted weights have valid def
   for(const s of [{mode:'other'},{mode:'weighted',weights:{price:0,latency:0,success:0}},{mode:'weighted',weights:{price:-1}},{mode:'weighted',weights:{price:Infinity}},{mode:'weighted',weights:{price:101}}])assert.throws(()=>validateStrategy(s));
   assert.deepEqual(validateStrategy({mode:'price'}),DEFAULT_STRATEGY);
 });
-test('model detection defaults on, rejects other model and incomplete results; toggle is explicit',()=>{
-  for(const change of [g=>delete g.model_detection,g=>g.model_detection.model='other',g=>g.model_detection.status='suspected',g=>g.model_detection.execution_complete=false]){
+test('channel detection rejects failed or incomplete results; toggle is explicit',()=>{
+  for(const change of [g=>delete g.model_detection,g=>g.model_detection.status='suspected',g=>g.model_detection.execution_complete=false]){
     const g=group(1);change(g);assert.ok(assess(g,config,snapshot([g]),now).reason);
     assert.equal(assess(g,config,snapshot([g]),now,{...DEFAULT_STRATEGY,requireDetection:false}).cost,1);
   }
+});
+test('passed channel detection accepts a different detection model',()=>{
+  const g=group(1);g.model_detection.model='different-model';g.model_detection.stages={text:{model:'another-model'}};
+  const result=assess(g,config,snapshot([g]),now);assert.equal(result.cost,1);assert.match(result.detection,/检测 different-model/);
+});
+test('over-limit channels are excluded from choices and counted by reason',()=>{
+  const current=group(1,1),blocked=group(2,.01);blocked.key_max_rate_multiplier=.5;
+  const result=run([current,blocked]);assert.equal(result.target,null);assert.deepEqual(result.state.choices.map(x=>x.id),[1]);assert.equal(result.state.excluded['超过此 key 的倍率上限'],1);
 });
 test('passed detection may omit optional completion fields but explicit false rejects',()=>{
   const g=group(1);delete g.model_detection.execution_complete;delete g.model_detection.applicable;assert.equal(assess(g,config,snapshot([g]),now).cost,1);

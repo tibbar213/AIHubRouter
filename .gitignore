@@ -3,3 +3,6 @@ work/
 dist/
 *.har
 .env*
+
+outputs/
+release-prep/

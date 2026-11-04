@@ -3,7 +3,7 @@ from zipfile import ZipFile, ZIP_DEFLATED
 import hashlib
 root=Path(__file__).resolve().parents[1]
 out=root/'dist';out.mkdir(exist_ok=True)
-target=out/'AIHubRouter-0.3.8-chromium.zip'
+target=out/'AIHubRouter-0.3.12-chromium.zip'
 allowed={'.js','.json','.html','.css','.png'}
 with ZipFile(target,'w',ZIP_DEFLATED) as z:
     for p in sorted((root/'extension').rglob('*')):

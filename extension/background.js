@@ -48,6 +48,17 @@ async function identity(app){
   }
   app.account=me.id;return me;
 }
+async function connectedIdentity(app){
+  await connectOpenTab();
+  const hadAuth=!!(await chrome.storage.session.get('auth')).auth;
+  try{await identity(app);}catch(e){
+    if(e.message!=='AUTH'||!hadAuth)throw e;
+    await connectOpenTab();
+    await identity(app);
+  }
+  if(app.notices['read-AUTH']){delete app.notices['read-AUTH'];log(app,'网站会话已恢复，继续检查');}
+  if(app.lastError===errorText(new Error('AUTH')))app.lastError=null;
+}
 function safeKey(k){return {id:k.id,name:k.name||`Key ${k.id}`,groupId:k.group_id,status:k.status,maxRate:k.max_rate_multiplier};}
 async function keys(){
   const result=[], deadline=Date.now()+12000;
@@ -83,7 +94,7 @@ async function check(){
   const app=await load();
   if(!app.configs.some(c=>!c.paused) && !Object.values(app.states).some(s=>s.pending))return;
   try{
-    await identity(app);
+    await connectedIdentity(app);
     const all=await keys();
     // Readback pending writes before fetching prices or attempting another write.
     const waiting=new Set();
@@ -187,8 +198,7 @@ async function handle(message){
     await save(app);return {ok:true};
   }
   if(message.type==='catalog'){
-    await connectOpenTab();
-    try{await identity(app);}catch(e){if(e.message!=='AUTH')throw e;await connectOpenTab();await identity(app);}
+    await connectedIdentity(app);
     const [all,snapshot]=await Promise.all([keys(),providers()]);app.catalog=catalogData(all,snapshot);await save(app);
     return app.catalog;
   }
@@ -216,7 +226,7 @@ async function handle(message){
     for(const c of app.configs){
       if(c.strategy&&!intervalChanged)continue;
       const s=app.states[c.keyId];
-      if(s){s.candidate=null;s.count=0;delete s.observedAt;delete s.choices;delete s.excluded;s.status=s.pending?'等待核实上次切换':'全局策略已更新，等待重新检查';}
+      if(s){s.candidate=null;s.count=0;delete s.observedAt;delete s.choices; delete s.rateLimitedChoices; delete s.excludedChoices;delete s.excluded;s.status=s.pending?'等待核实上次切换':'全局策略已更新，等待重新检查';}
     }
     log(app,'已更新全局排序策略及检查间隔');await save(app);await ensureAlarm();return {ok:true};
   }
@@ -227,7 +237,7 @@ async function handle(message){
     else if(message.field==='override' && typeof message.enabled==='boolean')c.strategy=message.enabled?validateStrategy(app.defaultStrategy):null;
     else if(message.field==='requireDetection' && typeof message.enabled==='boolean')c.strategy=validateStrategy({...c.strategy||app.defaultStrategy,requireDetection:message.enabled});
     else throw new Error('FORMAT');
-    const state=app.states[c.keyId]||{};state.candidate=null;state.count=0;delete state.observedAt;delete state.choices;delete state.excluded;state.status=c.paused?'已暂停，编辑后恢复':'设置已更新，等待检查';app.states[c.keyId]=state;
+    const state=app.states[c.keyId]||{};state.candidate=null;state.count=0;delete state.observedAt;delete state.choices; delete state.rateLimitedChoices; delete state.excludedChoices;delete state.excluded;state.status=c.paused?'已暂停，编辑后恢复':'设置已更新，等待检查';app.states[c.keyId]=state;
     log(app,`Key ${c.keyId} 设置已更新`);await save(app);return {ok:true};
   }
   if(message.type==='pause'||message.type==='remove'){
