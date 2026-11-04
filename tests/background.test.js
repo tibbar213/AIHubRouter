@@ -4,7 +4,7 @@ let seq=0;
 const clone=x=>structuredClone(x);
 async function boot({pending=false,automatic=true,auth=true}={}){
   const listeners={},local={},session=auth?{auth:'Bearer TEST_SESSION_ONLY'}:{};
-  let actual=1,failWrite=false,user=10,requests=[],notices=[];
+  let actual=1,failWrite=false,user=10,requests=[],notices=[],stale=false;
   const config={keyId:7,model:'model-test',platform:'openai',automatic,paused:false};
   local.app={configs:[config],states:{7:{expectedGroupId:1,...(pending?{pending:{from:1,to:2}}:{})}},logs:[],notices:{},pricing:{verified:true,basis:'base-times-rate'},account:10};
   function area(data){return {get:async key=>({[key]:clone(data[key])}),set:async obj=>Object.assign(data,clone(obj)),remove:async key=>{delete data[key];},setAccessLevel:async()=>{}};}
@@ -19,7 +19,7 @@ async function boot({pending=false,automatic=true,auth=true}={}){
     else if(path==='/api/v1/keys')data={pages:1,items:[{id:7,name:'Fake key',key:'SECRET_KEY_MUST_NOT_PERSIST',status:'active',group_id:actual,max_rate_multiplier:0}]};
     else if(path==='/api/v1/groups/available')data=[1,2].map(id=>({id,rate_multiplier:id===1?1:.1,peak_rate_enabled:false,subscription_type:'standard'}));
     else if(path==='/api/v1/groups/rates')data=null;
-    else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date(now).toISOString(),items:[group(1),group(2),{...group(3),platform:'new-provider'}]};
+    else if(path==='/api/v2/public/providers')data={stale,generated_at:new Date(now).toISOString(),items:[group(1),group(2),{...group(3),platform:'new-provider'}]};
     else if(path==='/api/v1/keys/7/group'){
       actual=JSON.parse(options.body).group_id;
       if(failWrite)throw new Error('simulated response lost');
@@ -29,8 +29,9 @@ async function boot({pending=false,automatic=true,auth=true}={}){
   };
   await import(`../extension/background.js?test=${seq++}`);
   const send=message=>new Promise(resolve=>listeners.message(message,{id:'test-id',url:'chrome-extension://test-id/options.html'},resolve));
-  return {send,local,session,listeners,requests,notices,setActual:n=>actual=n,setUser:n=>user=n,loseResponse:()=>failWrite=true};
+  return {send,local,session,listeners,requests,notices,setActual:n=>actual=n,setUser:n=>user=n,setStale:v=>stale=v,loseResponse:()=>failWrite=true};
 }
+test('stale platform snapshot reports expiry and never switches',async()=>{const b=await boot();b.setStale(true);await b.send({type:'check'});assert.match(b.local.app.lastError,/数据已过期/);assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);});
 test('background writes only group_id and persists no API key or session token',async()=>{
   const b=await boot();await b.send({type:'check'});
   const writes=b.requests.filter(r=>r.method==='PUT');assert.equal(writes.length,1);assert.deepEqual(JSON.parse(writes[0].body),{group_id:2});

@@ -38,7 +38,7 @@ export function platformPrice(group, model, now=Date.now()) {
   if (!validPrice(summary.effective_input_price_per_million)) {
     const cache=summary.range_cache, p=cache?.pricing_models?.[model], publicRate=group.public_rate_multiplier??group.rate_multiplier;
     const refreshed=Date.parse(cache?.refreshed_at);
-    if(group.platform!=='grok'||model!=='grok-4.7'||summary.effective_multiplier_reason!=='insufficient_samples'||cache?.ready!==true||cache?.coverage_complete!==true||cache?.stale!==false||!Number.isFinite(refreshed)||now-refreshed>INTERVAL||refreshed>now+60000||!p||!Number.isSafeInteger(p.usage_records)||p.usage_records<=0||!validPrice(p.sol_equivalent_unit_price)||!validPrice(publicRate)||!validPrice(group.rate_multiplier)||publicRate!==group.rate_multiplier||p.unknown_context_records!==0||p.long_input_tokens!==0||p.long_cache_read_tokens!==0||p.long_cache_creation_tokens!==0)return null;
+    if(summary.effective_multiplier_reason!=='insufficient_samples'||cache?.ready!==true||cache?.coverage_complete!==true||cache?.stale!==false||!Number.isFinite(refreshed)||now-refreshed>INTERVAL||refreshed>now+60000||!p||!Number.isSafeInteger(p.usage_records)||p.usage_records<=0||!validPrice(p.sol_equivalent_unit_price)||!validPrice(publicRate)||!validPrice(group.rate_multiplier)||publicRate!==group.rate_multiplier||p.unknown_context_records!==0||p.long_input_tokens!==0||p.long_cache_read_tokens!==0||p.long_cache_creation_tokens!==0)return null;
     const cost=p.sol_equivalent_unit_price*publicRate;
     return validPrice(cost)?{cost,predictedMultiplier:null,estimated:true,sampleCount:p.usage_records}:null;
   }

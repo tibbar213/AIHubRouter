@@ -78,7 +78,7 @@ function catalogData(all,snapshot){
   const models=[...new Map(snapshot.items.filter(g=>typeof g.platform==='string' && g.platform.length>0 && g.platform.length<=100).flatMap(g=>(g.group_models||[]).filter(m=>typeof m.model==='string' && m.model.length>0 && m.model.length<=200).map(m=>[JSON.stringify([g.platform,m.model]),{platform:g.platform,model:m.model}]))).values()].sort((a,b)=>a.platform.localeCompare(b.platform)||a.model.localeCompare(b.model));
   return {keys:all,models,at:Date.now()};
 }
-function errorText(e){return ({AUTH:'网站登录已失效，请打开平台并重新登录或刷新页面',NETWORK:'平台连接失败，将在下轮重试',FORBIDDEN:'平台拒绝请求，请检查登录状态或分组权限',FORMAT:'平台数据格式发生变化，本轮未切换',BUSINESS:'平台未确认操作成功，请检查后重试',HTTP:'平台服务异常，本轮停止',ACCOUNT:'当前账号与监控配置不一致',TAB_TIMEOUT:'读取已打开的 AIHub 页面超时，请刷新该页面后重试'})[e.message]||'检查未完成，本轮停止';}
+function errorText(e){return ({AUTH:'网站登录已失效，请打开平台并重新登录或刷新页面',NETWORK:'平台连接失败，将在下轮重试',FORBIDDEN:'平台拒绝请求，请检查登录状态或分组权限',FORMAT:'平台返回的数据无法识别，本轮未切换',STALE:'平台数据已过期或时间异常，本轮未切换，将在下轮重试',BUSINESS:'平台未确认操作成功，请检查后重试',HTTP:'平台服务异常，本轮停止',ACCOUNT:'当前账号与监控配置不一致',TAB_TIMEOUT:'读取已打开的 AIHub 页面超时，请刷新该页面后重试'})[e.message]||'检查未完成，本轮停止';}
 async function check(){
   const app=await load();
   if(!app.configs.some(c=>!c.paused) && !Object.values(app.states).some(s=>s.pending))return;
@@ -100,7 +100,7 @@ async function check(){
     await save(app);
     const snapshot=await authorizedSnapshot();
     app.catalog=catalogData(all,snapshot);
-    if(snapshot.stale!==false || !(Date.now()-Date.parse(snapshot.generated_at)<=INTERVAL) || Date.parse(snapshot.generated_at)>Date.now()+60000)throw new Error('FORMAT');
+    if(snapshot.stale!==false || !(Date.now()-Date.parse(snapshot.generated_at)<=INTERVAL) || Date.parse(snapshot.generated_at)>Date.now()+60000)throw new Error('STALE');
     for(const c of app.configs){
       if(c.paused || waiting.has(c.keyId))continue;
       if(urgentPause.has(c.keyId)||disconnectRequested){c.paused=true;continue;}
