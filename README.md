@@ -69,12 +69,12 @@
 
 ## 安装
 
-目前通过开发者模式安装，Chrome 和 Edge 商店版本尚未发布。
+从 [Releases](https://github.com/tibbar213/AIHubRouter/releases/latest) 下载 `AIHubRouter-版本号-chromium.zip`，Chrome 和 Edge 通用。两个商店版本尚未发布。
 
-1. [下载源码 ZIP](https://github.com/tibbar213/AIHubRouter/archive/refs/heads/main.zip) 并解压，或克隆本仓库。
+1. 下载 Release 安装包并解压。也可[下载源码 ZIP](https://github.com/tibbar213/AIHubRouter/archive/refs/heads/main.zip) 或克隆本仓库。
 2. Chrome 打开 `chrome://extensions`，Edge 打开 `edge://extensions`。
 3. 开启“开发者模式”，点击“加载已解压的扩展程序”。
-4. 选择解压目录中的 **`extension` 文件夹**，其中应包含 `manifest.json`。
+4. Release 安装包选择**解压后直接包含 `manifest.json` 的目录**；源码安装则选择仓库中的 **`extension` 文件夹**。
 5. 点击插件图标打开小窗；点击“在侧栏打开”可切换到侧栏。
 
 升级已解压扩展时，更新原安装目录，再到扩展管理页点击“重新加载”，以保留原扩展身份与配置。
