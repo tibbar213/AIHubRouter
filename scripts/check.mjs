@@ -6,3 +6,10 @@ for(const f of [manifest.background.service_worker,manifest.options_page,...Obje
 if(JSON.stringify(manifest.host_permissions)!==JSON.stringify(['https://aihub.top/*']))throw new Error('Unexpected host permissions');
 for(const file of await readdir('extension'))if(/\.har$/.test(file))throw new Error('HAR must not be packaged');
 console.log('Manifest, scripts, packaged assets and site scope verified.');
+const userscript=await readFile('userscript/AIHubRouter.user.js','utf8');
+execFileSync(process.execPath,['scripts/build-userscript.mjs','--check'],{stdio:'inherit'});
+execFileSync(process.execPath,['--check','userscript/AIHubRouter.user.js'],{stdio:'inherit'});
+const matches=[...userscript.matchAll(/^\/\/ @match\s+(.+)$/gm)].map(m=>m[1].trim());
+if(JSON.stringify(matches)!==JSON.stringify(['https://aihub.top/*']))throw new Error('Unexpected userscript scope');
+if(/^\/\/ @(require|connect)\s/m.test(userscript))throw new Error('Userscript must remain self-contained and same-origin');
+console.log('Userscript syntax and site scope verified.');

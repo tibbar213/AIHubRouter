@@ -20,6 +20,8 @@
 
 ## 它能做什么
 
+**油猴版已提供：** [安装与使用说明](userscript/README.md) · [可安装脚本](userscript/AIHubRouter.user.js)。在网站内浮窗使用，默认仅预览；需要保留 AIHub 标签页。请勿和扩展版同时自动管理同一个 key。
+
 在 [AIHub](https://aihub.top/providers) 为同一个模型比较不同渠道时，除了价格，还需要核对健康状态、账号权限和 key 的倍率上限。AIHubRouter 把这些检查放到浏览器扩展中，按你设置的策略持续比较，并在允许时调整 key 的首选分组。
 
 | 功能 | 使用方式 |

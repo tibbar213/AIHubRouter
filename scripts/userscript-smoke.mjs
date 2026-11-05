@@ -1,0 +1,112 @@
+import {chromium} from 'playwright-core';
+import {readFile,mkdir,mkdtemp} from 'node:fs/promises';
+import {resolve} from 'node:path';
+import assert from 'node:assert/strict';
+const source=await readFile('userscript/AIHubRouter.user.js','utf8');
+await mkdir('work',{recursive:true});
+const profile=await mkdtemp(resolve('work/userscript-smoke-'));
+const browser=await chromium.launchPersistentContext(profile,{executablePath:'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',headless:true,viewport:{width:1280,height:920}});
+let current=1,user=999,writes=0,lost=false,fail=false;
+const errors=[];
+try{
+  await browser.route('**/*',async route=>{
+    const request=route.request(),url=new URL(request.url()),path=url.pathname;
+    assert.equal(url.origin,'https://aihub.top');
+    if(!path.startsWith('/api/'))return route.fulfill({contentType:'text/html',body:'<!doctype html><title>模拟 AIHub</title><h1>模拟平台页面</h1>'});
+    const expires=new Date(Date.now()+90000).toISOString();
+    const group=id=>({group_id:id,code:'模拟渠道-'+id,platform:'openai',rate_multiplier:1,available:id!==1,probe_state:'enabled',probe_expires_at:expires,subscription_type:'standard',model_detection:{model:'实际检测模型',status:'passed'},group_models:[{model:'model-test'}],summary_models:{'model-test':{effective_input_price_per_million:id===1?1:.1}},model_cards:[{model:'model-test',health:'healthy',probe_state:'enabled',health_expires_at:expires}]});
+    let data;
+    if(path==='/api/v1/auth/me')data={id:user};
+    else if(path==='/api/v1/keys')data={pages:1,items:[{id:7,name:'模拟 Key',key:'SECRET_NEVER_STORE',status:'active',group_id:current,max_rate_multiplier:0}]};
+    else if(path==='/api/v1/groups/available')data=[1,2].map(id=>({id,rate_multiplier:1,subscription_type:'standard'}));
+    else if(path==='/api/v1/groups/rates')data=null;
+    else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date().toISOString(),items:[group(1),group(2)]};
+    else if(path==='/api/v1/keys/7/group'){
+      assert.equal(request.method(),'PUT');assert.deepEqual(request.postDataJSON(),{group_id:2});
+      writes++;if(!fail)current=2;
+      if(lost)return route.abort();data={group_id:current};
+    }else throw new Error('Unexpected API '+path);
+    await route.fulfill({json:{code:0,data}});
+  });
+  // Test-only synchronous GM storage substitute, shared by pages of this isolated origin.
+  await browser.addInitScript(()=>{
+    window.GM_getValue=(k,d)=>JSON.parse(localStorage.getItem('TEST_GM:'+k)||JSON.stringify(d));
+    window.GM_setValue=(k,v)=>localStorage.setItem('TEST_GM:'+k,JSON.stringify(v));
+    window.TEST_STORE_FAIL=false;
+    window.GM={getValue:async(k,d)=>GM_getValue(k,d),setValue:async(k,v)=>{
+      // Deliberately asynchronous: mutations must wait for the intent journal.
+      await new Promise(resolve=>setTimeout(resolve,5));
+      if(window.TEST_STORE_FAIL&&k==='aihubrouter:app:v1'&&Object.values(JSON.parse(v).states||{}).some(s=>s.pending))throw new Error('模拟存储失败');
+      GM_setValue(k,v);
+    }};
+    window.GM_registerMenuCommand=()=>{};
+    localStorage.setItem('auth_token','FAKE_SESSION');
+  });
+  const script=source.replace('startScheduler();','globalThis.TEST_ROUTER={send:chrome.runtime.sendMessage};startScheduler();');
+  async function page(){const p=await browser.newPage();p.on('pageerror',e=>errors.push(e.message));await p.goto('https://aihub.top/providers');await p.evaluate(script);return p;}
+  const a=await page(),b=await page();
+  const send=(p,m)=>p.evaluate(m=>TEST_ROUTER.send(m),m);
+  const state=async()=> (await send(a,{type:'state'})).result.app;
+  await a.getByRole('button',{name:'↗ AIHubRouter',exact:true}).click();
+  await a.getByRole('button',{name:'配置',exact:true}).click();
+  await a.getByRole('button',{name:'读取 key 与模型',exact:true}).click();
+  await a.locator('#keyId').selectOption('7');
+  await a.locator('#model').selectOption(JSON.stringify({platform:'openai',model:'model-test'}));
+  await a.getByRole('button',{name:'保存 key 配置',exact:true}).click();
+  await a.getByText('已完成',{exact:true}).waitFor();
+  await send(a,{type:'check'});assert.equal(writes,0);assert.equal((await state()).configs[0].automatic,false);
+  await send(a,{type:'toggleKey',keyId:7,field:'automatic',enabled:true});
+  await Promise.all([send(a,{type:'check'}),send(b,{type:'check'})]);assert.equal(writes,1);
+  assert.equal((await state()).states[7].pending,null);
+  // Journal persistence failure must prevent any network mutation.
+  current=1;await send(a,{type:'check'});
+  await a.evaluate(()=>window.TEST_STORE_FAIL=true);
+  const failedJournal=await send(a,{type:'check'});
+  assert.ok(failedJournal.error);assert.equal(writes,1);
+  await a.evaluate(()=>window.TEST_STORE_FAIL=false);
+  lost=true;await send(a,{type:'check'});assert.equal(writes,2);assert.equal((await state()).states[7].pending.to,2);
+  await send(b,{type:'check'});assert.equal(writes,2);assert.equal((await state()).states[7].pending,null);
+  current=1;await send(a,{type:'check'});fail=true;await send(a,{type:'check'});await send(b,{type:'check'});
+  assert.equal((await state()).configs[0].paused,true);assert.equal(writes,3);
+  const configured=await send(a,{type:'configure',keyId:7,platform:'openai',model:'model-test',automatic:true});assert.equal(configured.error,undefined);
+  user=123;await send(b,{type:'check'});assert.equal((await state()).accountMismatch,true);assert.equal(writes,3);
+  const stored=await a.evaluate(()=>localStorage.getItem('TEST_GM:aihubrouter:app:v1'));
+  assert.ok(!stored.includes('SECRET_NEVER_STORE'));assert.ok(!stored.includes('FAKE_SESSION'));
+  await send(a,{type:'disconnect'});await b.reload();await b.evaluate(script);
+  assert.equal((await send(b,{type:'state'})).result.connected,false);
+  await mkdir('outputs',{recursive:true});
+  await a.screenshot({path:'outputs/userscript-desktop.png'});
+  await a.setViewportSize({width:390,height:844});
+  assert.equal(await a.locator('.panel').evaluate(e=>e.scrollWidth<=e.clientWidth),true);
+  await a.screenshot({path:'outputs/userscript-mobile.png'});
+  // The host reset must not override the shadow theme's inherited text color.
+  for(const colorScheme of ['dark','light']){
+    await a.emulateMedia({colorScheme});
+    const theme=await a.locator('#monitorPanel h1').evaluate(e=>{
+      const host=e.getRootNode().host;
+      return {actual:getComputedStyle(e).color,expected:getComputedStyle(host).getPropertyValue('--ink').trim()};
+    });
+    const expected=theme.expected.match(/\w\w/g).map(v=>parseInt(v,16));
+    assert.equal(theme.actual,`rgb(${expected.join(', ')})`);
+  }
+  await a.emulateMedia({colorScheme:'dark'});
+  await a.waitForTimeout(250); // Let existing button theme transitions finish before the screenshot.
+  await a.screenshot({path:'outputs/userscript-mobile-dark.png'});
+  // Two new tabs start their schedulers together with an overdue automatic key.
+  await a.close();await b.close();current=1;user=999;lost=false;fail=false;
+  const seed=await browser.newPage();await seed.goto('https://aihub.top/providers');
+  await seed.evaluate(()=>{
+    GM_setValue('aihubrouter:disconnected:v1',false);
+    GM_setValue('aihubrouter:app:v1',JSON.stringify({schemaVersion:7,account:999,checkMinutes:5,configs:[{keyId:7,platform:'openai',model:'model-test',automatic:true,paused:false}],states:{7:{expectedGroupId:1}},logs:[],notices:{},defaultStrategy:{mode:'price'}}));
+  });
+  const scheduled=await Promise.all([page(),page()]);
+  await scheduled[0].waitForFunction(()=>{
+    const app=JSON.parse(GM_getValue('aihubrouter:app:v1','null'));
+    return app.states[7].expectedGroupId===2&&app.states[7].pending===null;
+  });
+  assert.equal(writes,4);
+  const attempt=await scheduled[0].evaluate(()=>JSON.parse(GM_getValue('aihubrouter:app:v1','null')).lastAttempt);
+  assert.ok(Date.now()-attempt<60000);
+  assert.deepEqual(errors,[]);
+  console.log('Userscript offline smoke passed: UI binding, preview, two-tab serialization, unknown writes, no replay, account guard, persistent disconnect, narrow layout, credential minimization.');
+}finally{await browser.close();}
