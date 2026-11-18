@@ -24,17 +24,28 @@ try{
   assert.equal(await page.title(),'AIHubRouter');
   assert.equal(await page.locator('#ratio,#read,#write,#basis,#verified').count(),0);
   await page.getByRole('button',{name:'配置',exact:true}).click();
-  await page.getByText('全局默认策略',{exact:true}).waitFor();
-  assert.equal(await page.locator('#globalMode').inputValue(),'price');
-  await page.locator('#globalMode').selectOption('weighted');
-  assert.equal(await page.locator('#globalWeights').isVisible(),true);
-  await page.locator('#globalPrice').fill('60');await page.locator('#globalLatency').fill('30');await page.locator('#globalSuccess').fill('10');
-  await page.locator('#globalAdvanced summary').click();
-  assert.equal(await page.locator('#globalDetection, #keyDetection').count(),0);
-  await page.locator('#globalMinSuccess').fill('90');
-  await page.locator('#globalMinSamples').fill('10');
-  await page.locator('#globalConfirmRounds').fill('3');
-  await page.getByRole('button',{name:'保存全局策略',exact:true}).click();
+  await page.getByText('新建 Key 的默认策略',{exact:true}).waitFor();
+  const template=page.locator('#defaultStrategyForm');
+  assert.equal(await template.locator('[name=mode]').inputValue(),'price');
+  await template.locator('[name=mode]').selectOption('cacheHit');
+  await page.getByRole('button',{name:'保存默认策略与检查间隔',exact:true}).click();
+  await page.getByText('已完成',{exact:true}).waitFor();
+  assert.equal((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).defaultStrategy.mode,'cacheHit');
+  await template.locator('[name=mode]').selectOption('rate');
+  assert.equal(await template.locator('[data-weights]').isVisible(),false);
+  await page.getByRole('button',{name:'保存默认策略与检查间隔',exact:true}).click();
+  await page.getByText('已完成',{exact:true}).waitFor();
+  assert.equal((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).defaultStrategy.mode,'rate');
+  await template.locator('[name=mode]').selectOption('weighted');
+  assert.equal(await template.locator('[data-weights]').isVisible(),true);
+  await template.locator('[name=price]').fill('60');await template.locator('[name=latency]').fill('30');await template.locator('[name=success]').fill('10');
+  await template.locator('details summary').click();
+  assert.equal(await template.locator('[name=requireDetection]').isChecked(),true);
+  await template.locator('[name=minSuccess]').fill('90');
+  await template.locator('[name=minCacheHit]').fill('80');
+  await template.locator('[name=minSamples]').fill('10');
+  await template.locator('[name=confirmRounds]').fill('3');
+  await page.getByRole('button',{name:'保存默认策略与检查间隔',exact:true}).click();
   await page.getByText('已完成',{exact:true}).waitFor();
   assert.equal((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).defaultStrategy.weights.price,60);
   await page.screenshot({path:'outputs/settings-preview.png',fullPage:true});
@@ -55,9 +66,13 @@ try{
       else if(path==='/api/v1/keys')data={pages:1,items:[{id:101,name:'测试用 key',status:'active',group_id:current,max_rate_multiplier:globalThis.testRateLimit,key:'MUST_NOT_LEAVE_TEST'}]};
       else if(path==='/api/v1/groups/available')data=[12,24].map(id=>({id,rate_multiplier:1,peak_rate_enabled:false,subscription_type:'standard'}));
       else if(path==='/api/v1/groups/rates')data={24:.1};
-      else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date().toISOString(),items:[12,24].map(id=>({group_id:id,code:'示例-'+id,platform:'openai',rate_multiplier:1,available:id===24||globalThis.testAllHealthy,probe_state:'enabled',probe_expires_at:expires,long_context_pricing_enabled:false,subscription_type:'standard',model_detection:{model:'gpt-example',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'gpt-example',price}],summary_models:{'gpt-example':{effective_input_price_per_million:id===12?1:.1,effective_multiplier:.05,effective_multiplier_ready:true,sample_count:100,user_latency_ms:id===12?1000:2000,success_rate:id===12?.95:.99}},model_cards:[{model:'gpt-example',health:'healthy',probe_state:'enabled',health_expires_at:expires}]}))};
+      else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date().toISOString(),items:[12,24].map(id=>({group_id:id,code:'示例-'+id,platform:'openai',rate_multiplier:1,available:id===24||globalThis.testAllHealthy,probe_state:'enabled',probe_expires_at:expires,long_context_pricing_enabled:false,subscription_type:'standard',model_detection:{model:'gpt-example',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'gpt-example',price}],summary_models:{'gpt-example':{effective_input_price_per_million:id===12?1:.1,effective_multiplier:.05,effective_multiplier_ready:true,range_cache:{ready:true,coverage_complete:true,stale:false,usage_records:100,refreshed_at:new Date().toISOString(),cache_hit_rate:.9},sample_count:100,user_latency_ms:id===12?1000:2000,success_rate:id===12?.95:.99}},model_cards:[{model:'gpt-example',health:'healthy',probe_state:'enabled',health_expires_at:expires}]}))};
       else if(path==='/api/v1/keys/101/group'){globalThis.testWrites.push(JSON.parse(options.body));current=JSON.parse(options.body).group_id;data={group_id:current};}
       else throw new Error('Unexpected test request');
+      if(path==='/api/v2/public/providers' && globalThis.testEstimatePrices)for(const group of data.items){
+        const summary=group.summary_models['gpt-example'];summary.effective_input_price_per_million=null;
+        summary.range_cache.pricing_models={'gpt-example':{usage_records:100,input_tokens:100,cache_read_tokens:900,cache_creation_tokens:0,baseline_input_per_million:5,sol_equivalent_unit_price:.95,unknown_context_records:0,long_input_tokens:0,long_cache_read_tokens:0,long_cache_creation_tokens:0}};
+      }
       return {ok:true,status:200,json:async()=>({code:0,data})};
     };
   });
@@ -68,13 +83,41 @@ try{
   await page.locator('#model').selectOption({label:'OpenAI / gpt-example'});
   await page.getByRole('button',{name:'保存 key 配置',exact:true}).click();
   try { await page.getByRole('heading',{name:'gpt-example · Key 101',exact:true}).waitFor({timeout:5000}); } catch(e) { console.log('UI status:', await page.locator('#message').innerText()); console.log('Page errors:', errors); throw e; }
-  await page.getByLabel('使用独立策略').check();
-  await page.getByText('最近确认分组 12 · 独立策略', {exact:false}).waitFor();
+  await page.getByRole('button',{name:'调整策略',exact:true}).click();
+  const editor=page.getByRole('form',{name:'Key 101 的策略'});
+  assert.equal(await editor.locator('[name=mode]').inputValue(),'weighted');
+  await editor.locator('[name=mode]').selectOption('cacheHit');
+  await editor.getByRole('button',{name:'保存策略',exact:true}).click();
+  await page.getByText('最近确认分组 12 · 缓存率更高优先',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'调整策略',exact:true}).click();
+  assert.equal(await editor.locator('[name=mode]').inputValue(),'cacheHit');
+  await editor.locator('[name=mode]').selectOption('rate');
+  await editor.getByRole('button',{name:'保存策略',exact:true}).click();
+  await page.getByText('最近确认分组 12 · 账号倍率优先',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'调整策略',exact:true}).click();
+  assert.equal(await editor.locator('[name=mode]').inputValue(),'rate');
+  await editor.locator('[name=mode]').selectOption('price');
+  await editor.locator('details summary').click();
+  assert.equal(await editor.locator('[name=minSuccess]').inputValue(),'90');
+  assert.equal(await editor.locator('[name=minCacheHit]').inputValue(),'80');
+  await editor.locator('[name=confirmRounds]').fill('2');
+  await editor.getByRole('button',{name:'保存策略',exact:true}).click();
+  await page.getByText('最近确认分组 12 · 真实价格优先',{exact:true}).waitFor();
+  assert.equal(await page.locator('[data-panel=settings]').isVisible(),false);
+  const saved=await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app);
+  assert.equal(saved.configs[0].strategy.rules.confirmRounds,2);
+  assert.equal(saved.defaultStrategy.mode,'weighted');
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByText('仅预览 · 预览：建议分组 24',{exact:true}).waitFor();
   assert.equal(await page.locator('.monitor details').first().evaluate(e=>e.open),false);
   await page.locator('.monitor details summary').first().click();
-  assert.equal(await page.locator('.candidate-details table thead th').count(),9);
+  const candidateTable=page.locator('.candidate-details table');
+  assert.equal(await candidateTable.locator('thead th').count(),12);
+  assert.equal(await candidateTable.locator('td[data-label="缓存率"]').textContent(),'90.00%');
+  for(const label of ['消费名次','平台告警']){
+    await candidateTable.getByRole('columnheader',{name:label,exact:true}).waitFor();
+    assert.equal(await candidateTable.locator(`td[data-label="${label}"]`).textContent(),'未知');
+  }
   await page.locator('.candidate-details').getByRole('button',{name:'用户评分',exact:true}).click();
   await page.setViewportSize({width:420,height:700});
   assert.equal(await page.locator('.candidate-details thead').isVisible(),false);
@@ -95,13 +138,20 @@ try{
   await page.locator('.candidate-details .compact-sort select').selectOption('cost:1');
   await page.setViewportSize({width:1200,height:1000});
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[]);
-  await page.getByLabel('使用独立策略').uncheck();
   await page.getByLabel('自动改组').check();
-  await page.getByText('最近确认分组 12 · 继承全局', {exact:false}).waitFor();
+  await page.getByText('最近确认分组 12 · 真实价格优先',{exact:true}).waitFor();
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByText('自动切换 · 已确认切换成功',{exact:true}).waitFor();
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
   await worker.evaluate(()=>{globalThis.testAllHealthy=true;});
+  await worker.evaluate(()=>{globalThis.testEstimatePrices=true;});
+  await page.getByRole('button',{name:'立即检查',exact:true}).click();
+  await page.locator('.current-summary .badge').getByText('缓存率 × 账号倍率估算',{exact:true}).waitFor();
+  assert.match(await page.locator('.price-estimate').first().textContent(),/缓存率 × 账号倍率估算 · 100 条样本/);
+  assert.match(await page.locator('.price-estimate').first().getAttribute('title'),/按平台计价单位/);
+  assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
+  await page.screenshot({path:'outputs/cache-price-estimate.png',fullPage:true});
+  await worker.evaluate(()=>{globalThis.testEstimatePrices=false;});
   await worker.evaluate(()=>{globalThis.testRateLimit=.5;});
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.locator('.exclusions summary').click();
@@ -122,6 +172,19 @@ try{
   await page.getByRole('button',{name:'确认切换',exact:true}).click();
   await page.getByText('已暂停 · 手动切换成功，自动选择已暂停',{exact:true}).waitFor();
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24},{group_id:12}]);
+  await worker.evaluate(async()=>{
+    const {app}=await chrome.storage.local.get('app');
+    for(const state of Object.values(app.states)){
+      state.rankingBasis='accountMultiplier';
+      state.status='全部真实价格缺失，当前账号倍率最低（同倍率不切）';
+      for(const choice of state.choices||[])choice.cost=null;
+    }
+    await chrome.storage.local.set({app});
+  });
+  await page.reload();
+  await page.locator('.candidate-details summary').click();
+  await page.getByText('全部合格渠道的真实价格缺失，本轮按账号倍率从低到高选择；同倍率保留当前渠道。',{exact:true}).waitFor();
+  assert.equal(await page.locator('.compact-sort option[value="score:-1"]').textContent(),'策略排序 · 账号倍率低优先');
   await page.getByRole('button',{name:'移除监控',exact:true}).click();
   await page.getByText('还没有监控。先连接平台，再绑定 key 和模型。').waitFor();
   assert.deepEqual(errors,[]);

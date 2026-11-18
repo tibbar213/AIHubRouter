@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 let seq=0;
 const clone=x=>structuredClone(x);
-async function boot({pending=false,automatic=true,auth=true}={}){
+async function boot({pending=false,automatic=true,auth=true,noPrices=false,cacheRates=false,estimatedPrices=false,modelHealthOnly=false}={}){
   const listeners={},local={},session=auth?{auth:'Bearer TEST_SESSION_ONLY'}:{};
   let actual=1,failWrite=false,user=10,requests=[],notices=[],stale=false;
   const config={keyId:7,model:'model-test',platform:'openai',automatic,paused:false};
@@ -19,7 +19,29 @@ async function boot({pending=false,automatic=true,auth=true}={}){
     else if(path==='/api/v1/keys')data={pages:1,items:[{id:7,name:'Fake key',key:'SECRET_KEY_MUST_NOT_PERSIST',status:'active',group_id:actual,max_rate_multiplier:0}]};
     else if(path==='/api/v1/groups/available')data=[1,2].map(id=>({id,rate_multiplier:id===1?1:.1,peak_rate_enabled:false,subscription_type:'standard'}));
     else if(path==='/api/v1/groups/rates')data=null;
-    else if(path==='/api/v2/public/providers')data={stale,generated_at:new Date(now).toISOString(),items:[group(1),group(2),{...group(3),platform:'new-provider'}]};
+    else if(path==='/api/v2/public/providers'){
+      const items=[group(1),group(2),{...group(3),platform:'new-provider'}];
+      if(modelHealthOnly){
+        items.push(group(4));
+        for(const g of items){
+          g.visible_in_hall=g.group_id===1;
+          g.available=false;
+          g.detections_enabled=true;
+          g.probe_skipped=false;
+        }
+        delete items[0].probe_state;
+        delete items[0].probe_expires_at;
+        delete items[0].model_cards[0].probe_state;
+      }
+      if(noPrices)for(const g of items){g.available=true;g.summary_models['model-test'].effective_input_price_per_million=null;}
+      if(cacheRates)for(const g of items){g.available=true;g.summary_models['model-test'].range_cache={ready:true,coverage_complete:true,stale:false,usage_records:10,refreshed_at:new Date(now).toISOString(),cache_hit_rate:g.group_id===1?.8:.9};}
+      if(estimatedPrices)for(const g of items){
+        g.available=true;g.summary_models['model-test'].effective_input_price_per_million=null;
+        g.summary_models['model-test'].range_cache={ready:true,coverage_complete:true,stale:false,usage_records:10,refreshed_at:new Date(now).toISOString(),cache_hit_rate:.8,
+          pricing_models:{'model-test':{usage_records:10,input_tokens:200,cache_read_tokens:800,cache_creation_tokens:0,baseline_input_per_million:5,sol_equivalent_unit_price:1.4,unknown_context_records:0,long_input_tokens:0,long_cache_read_tokens:0,long_cache_creation_tokens:0}}};
+      }
+      data={stale,generated_at:new Date(now).toISOString(),items};
+    }
     else if(path==='/api/v1/keys/7/group'){
       actual=JSON.parse(options.body).group_id;
       if(failWrite)throw new Error('simulated response lost');
@@ -40,6 +62,66 @@ test('background writes only group_id and persists no API key or session token',
   assert.ok(!JSON.stringify(b.local).includes('SECRET_KEY'));assert.ok(!JSON.stringify(b.local).includes('TEST_SESSION'));
 });
 test('preview never sends PUT',async()=>{const b=await boot({automatic:false});await b.send({type:'check'});assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);assert.match(b.local.app.states[7].status,/预览/);});
+test('candidate preview includes healthy bindable groups with both Hall flags false',async()=>{
+  const b=await boot({modelHealthOnly:true,automatic:false});
+  await b.send({type:'check'});
+  assert.deepEqual(b.local.app.states[7].choices.map(c=>c.id),[2,1]);
+  assert.equal(b.local.app.states[7].excluded['当前账号不可绑定'],1);
+  assert.match(b.local.app.states[7].status,/预览/);
+  assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);
+});
+test('automatic all-unpriced fallback writes the lower account rate and confirms readback',async()=>{
+  const b=await boot({noPrices:true});await b.send({type:'check'});
+  const writes=b.requests.filter(r=>r.method==='PUT');assert.equal(writes.length,1);
+  assert.deepEqual(JSON.parse(writes[0].body),{group_id:2});
+  assert.equal(b.local.app.states[7].rankingBasis,'accountMultiplier');
+  assert.equal(b.local.app.states[7].expectedGroupId,2);
+  assert.equal(b.local.app.states[7].status,'已确认切换成功');
+  assert.equal(b.local.app.states[7].pending,null);
+  await b.send({type:'check'});assert.equal(b.requests.filter(r=>r.method==='PUT').length,1);
+  assert.match(b.local.app.states[7].status,/同倍率不切/);
+  const preview=await boot({noPrices:true,automatic:false});await preview.send({type:'check'});
+  assert.equal(preview.requests.filter(r=>r.method==='PUT').length,0);
+});
+
+test('per-key rate strategy is saved and performs an automatic switch',async()=>{
+  const b=await boot();
+  const update=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'rate'}});
+  assert.equal(update.error,undefined);assert.equal(b.local.app.configs[0].strategy.mode,'rate');
+  await b.send({type:'check'});
+  assert.deepEqual(b.requests.filter(r=>r.method==='PUT').map(r=>JSON.parse(r.body)),[{group_id:2}]);
+  assert.equal(b.local.app.states[7].rankingBasis,'rate');
+  assert.equal(b.local.app.states[7].expectedGroupId,2);
+});
+
+test('per-key cache threshold persists and prevents writes without model cache data',async()=>{
+  const b=await boot();
+  const result=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'rate',rules:{minCacheHit:80}}});
+  assert.equal(result.error,undefined);assert.equal(b.local.app.configs[0].strategy.rules.minCacheHit,80);
+  await b.send({type:'check'});
+  assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);
+  assert.equal(b.local.app.states[7].excluded['指定模型缓存率未知或数据未就绪'],1);
+});
+
+test('cache priority saves and switches a healthy current channel to the higher cache rate',async()=>{
+  const b=await boot({cacheRates:true});
+  const result=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'cacheHit'}});
+  assert.equal(result.error,undefined);assert.equal(b.local.app.configs[0].strategy.mode,'cacheHit');
+  await b.send({type:'check'});
+  assert.deepEqual(b.requests.filter(r=>r.method==='PUT').map(r=>JSON.parse(r.body)),[{group_id:2}]);
+  assert.equal(b.local.app.states[7].expectedGroupId,2);assert.equal(b.local.app.states[7].rankingBasis,'cacheHit');
+  await b.send({type:'check'});assert.equal(b.requests.filter(r=>r.method==='PUT').length,1);
+});
+
+test('cache-price estimation drives automatic writes and still enforces the minimum cache rate',async()=>{
+  const b=await boot({estimatedPrices:true});await b.send({type:'check'});
+  assert.deepEqual(b.requests.filter(r=>r.method==='PUT').map(r=>JSON.parse(r.body)),[{group_id:2}]);
+  const state=b.local.app.states[7];assert.equal(state.expectedGroupId,2);
+  assert.equal(state.choices[0].estimateKind,'cache-rate');assert.ok(Math.abs(state.choices[0].cost-.14)<1e-12);
+  await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'price',rules:{minCacheHit:90}}});
+  await b.send({type:'check'});assert.equal(b.requests.filter(r=>r.method==='PUT').length,1);
+  assert.equal(b.local.app.states[7].choices.length,0);
+});
 test('lost mutation response journals intent then next cycle reads back without replaying',async()=>{
   const b=await boot();b.loseResponse();await b.send({type:'check'});assert.equal(b.local.app.states[7].pending.to,2);
   await b.send({type:'check'});assert.equal(b.requests.filter(r=>r.method==='PUT').length,1);assert.equal(b.local.app.states[7].pending,null);assert.equal(b.local.app.states[7].expectedGroupId,2);
@@ -49,27 +131,80 @@ test('account changes pause all configurations before reading keys or writing',a
 test('missing session is notified once across repeated polls',async()=>{const b=await boot({auth:false});await b.send({type:'check'});await b.send({type:'check'});assert.equal(b.notices.length,1);assert.equal(b.requests.length,0);});
 test('external group changes update baseline without pausing or writing in same cycle',async()=>{const b=await boot();b.setActual(3);await b.send({type:'check'});assert.equal(b.local.app.configs[0].paused,false);assert.equal(b.local.app.states[7].expectedGroupId,3);assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);});
 test('detection toggle creates per-key strategy while preserving global settings',async()=>{const b=await boot();await b.send({type:'state'});await b.send({type:'toggleKey',keyId:7,field:'requireDetection',enabled:false});assert.equal(b.local.app.configs[0].strategy.requireDetection,false);assert.equal(b.local.app.defaultStrategy.requireDetection,true);});
+test('resuming a paused key preserves config and allows a later automatic check',async()=>{
+  const b=await boot();
+  await b.send({type:'toggleKey',keyId:7,field:'excludeWarnings',enabled:true});
+  assert.equal(b.local.app.configs[0].strategy.mode,'price');
+  const config=clone(b.local.app.configs[0]);
+  await b.send({type:'pause',keyId:7});
+  assert.equal(b.local.app.configs[0].paused,true);
+  assert.equal((await b.send({type:'resume',keyId:7})).error,undefined);
+  assert.deepEqual(b.local.app.configs[0],config);
+  assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);
+  await b.send({type:'check'});
+  assert.equal(b.requests.filter(r=>r.method==='PUT').length,1);
+});
+test('resume blocks unresolved switches and a different platform account',async()=>{
+  const b=await boot({pending:true});
+  await b.send({type:'pause',keyId:7});
+  const pending=await b.send({type:'resume',keyId:7});
+  assert.match(pending.error,/核实上次切换结果/);
+  assert.equal(b.requests.length,0);
+  await b.send({type:'check'});
+  b.setUser(99);
+  const mismatch=await b.send({type:'resume',keyId:7});
+  assert.match(mismatch.error,/账号/);
+  assert.equal(b.local.app.configs[0].paused,true);
+  assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);
+});
 test('catalog and binding accept a newly introduced platform',async()=>{const b=await boot();const catalog=await b.send({type:'catalog'});assert.ok(catalog.result.models.some(m=>m.platform==='new-provider'&&m.model==='model-test'));const result=await b.send({type:'configure',keyId:7,platform:'new-provider',model:'model-test',automatic:false});assert.equal(result.error,undefined);});
 test('credentials are captured only from platform tab requests, not extension requests',async()=>{
   const b=await boot({auth:false});b.listeners.auth({tabId:-1,requestHeaders:[{name:'Authorization',value:'Bearer fake-extension'}]});
   await b.send({type:'state'});assert.equal(b.session.auth,undefined);
   b.listeners.auth({tabId:8,initiator:'https://aihub.top',requestHeaders:[{name:'Authorization',value:'Bearer fake-site'}]});await b.send({type:'state'});assert.equal(b.session.auth,'Bearer fake-site');
 });
-test('global strategy update resets inheriting keys only and preserves pending journal',async()=>{
+test('editing the default template preserves existing key strategies and observations',async()=>{
   const b=await boot();await b.send({type:'state'});
   b.local.app.configs.push({keyId:8,strategy:{mode:'success'},paused:false});
   b.local.app.states[7]={candidate:2,count:2,pending:{from:1,to:2}};
   b.local.app.states[8]={candidate:9,count:2};
   const r=await b.send({type:'strategy',strategy:{mode:'latency'}});assert.equal(r.error,undefined);
-  assert.equal(b.local.app.defaultStrategy.mode,'latency');assert.equal(b.local.app.states[7].count,0);
+  assert.equal(b.local.app.defaultStrategy.mode,'latency');assert.equal(b.local.app.configs[0].strategy.mode,'price');assert.equal(b.local.app.states[7].count,2);
   assert.deepEqual(b.local.app.states[7].pending,{from:1,to:2});assert.equal(b.local.app.states[8].count,2);
 });
-test('configure validates and saves independent strategy or explicit inheritance',async()=>{
+test('configure copies the default for new keys and preserves the strategy on rebinding',async()=>{
   const b=await boot();
   const base={type:'configure',keyId:7,model:'model-test',platform:'openai',automatic:false};
   const invalid=await b.send({...base,strategy:{mode:'weighted',weights:{price:0,latency:0,success:0}}});assert.ok(invalid.error);
   await b.send({...base,strategy:{mode:'success'}});assert.equal(b.local.app.configs[0].strategy.mode,'success');
-  await b.send({...base,strategy:null});assert.equal(b.local.app.configs[0].strategy,null);
+  await b.send({type:'strategy',strategy:{mode:'latency'}});
+  await b.send(base);assert.equal(b.local.app.configs[0].strategy.mode,'success');
+  await b.send({type:'remove',keyId:7});
+  await b.send(base);assert.equal(b.local.app.configs[0].strategy.mode,'latency');
+});
+test('inline strategy updates only the selected key and preserves its monitoring controls',async()=>{
+  const b=await boot();
+  await b.send({type:'state'});
+  b.local.app.configs[0].strategy.requireDetection=false;
+  b.local.app.configs[0].excludeWarnings=true;
+  b.local.app.configs[0].paused=true;
+  b.local.app.configs.push({keyId:8,strategy:{mode:'success'},paused:false});
+  b.local.app.states[7].count=2;
+  b.local.app.states[8]={candidate:9,count:2};
+  const change=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'latency',rules:{confirmRounds:3}}});
+  assert.equal(change.error,undefined);
+  const [updated,other]=b.local.app.configs;
+  assert.equal(updated.strategy.mode,'latency');
+  assert.equal(updated.strategy.rules.confirmRounds,3);
+  assert.equal(updated.strategy.requireDetection,false);
+  assert.equal(updated.automatic,true);
+  assert.equal(updated.excludeWarnings,true);
+  assert.equal(updated.paused,true);
+  assert.equal(other.strategy.mode,'success');
+  assert.equal(b.local.app.defaultStrategy.mode,'price');
+  assert.equal(b.local.app.states[7].count,0);
+  assert.equal(b.local.app.states[8].count,2);
+  assert.equal(b.requests.length,0);
 });
 test('manual switch revalidates and pauses automation even in preview mode',async()=>{
   const b=await boot({automatic:false});

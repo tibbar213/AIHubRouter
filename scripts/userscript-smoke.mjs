@@ -6,7 +6,7 @@ const source=await readFile('userscript/AIHubRouter.user.js','utf8');
 await mkdir('work',{recursive:true});
 const profile=await mkdtemp(resolve('work/userscript-smoke-'));
 const browser=await chromium.launchPersistentContext(profile,{executablePath:'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',headless:true,viewport:{width:1280,height:920}});
-let current=1,user=999,writes=0,lost=false,fail=false;
+let current=1,user=999,writes=0,lost=false,fail=false,missingPrice=false;
 const errors=[];
 try{
   await browser.route('**/*',async route=>{
@@ -20,7 +20,17 @@ try{
     else if(path==='/api/v1/keys')data={pages:1,items:[{id:7,name:'模拟 Key',key:'SECRET_NEVER_STORE',status:'active',group_id:current,max_rate_multiplier:0}]};
     else if(path==='/api/v1/groups/available')data=[1,2].map(id=>({id,rate_multiplier:1,subscription_type:'standard'}));
     else if(path==='/api/v1/groups/rates')data=null;
-    else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date().toISOString(),items:[group(1),group(2)]};
+    else if(path==='/api/v2/public/providers'){
+      const ranked={...group(2),badges_expires_at:expires,badges:{
+        popularity:{status:'measured',rank:8,groups:214,window:'24h',expires_at:expires},
+        warnings:[{id:'high_error',status:'active',triggers:[{value:32.47,threshold:20,operator:'>=',window:'7d',complete:false,available:true}]}]
+      }};
+      if(missingPrice){
+        ranked.group_models[0].price={input_per_million:2,output_per_million:8,cache_input_per_million:0};
+        ranked.summary_models['model-test'].effective_input_price_per_million=null;
+      }
+      data={stale:false,generated_at:new Date().toISOString(),items:[group(1),ranked]};
+    }
     else if(path==='/api/v1/keys/7/group'){
       assert.equal(request.method(),'PUT');assert.deepEqual(request.postDataJSON(),{group_id:2});
       writes++;if(!fail)current=2;
@@ -54,10 +64,42 @@ try{
   await a.locator('#model').selectOption(JSON.stringify({platform:'openai',model:'model-test'}));
   await a.getByRole('button',{name:'保存 key 配置',exact:true}).click();
   await a.getByText('已完成',{exact:true}).waitFor();
-  await send(a,{type:'check'});assert.equal(writes,0);assert.equal((await state()).configs[0].automatic,false);
+  await a.getByRole('button',{name:'调整策略',exact:true}).click();
+  const strategyEditor=a.getByRole('form',{name:'Key 7 的策略'});
+  await strategyEditor.locator('details summary').click();
+  await strategyEditor.locator('[name=confirmRounds]').fill('2');
+  await strategyEditor.getByRole('button',{name:'保存策略',exact:true}).click();
+  await strategyEditor.waitFor({state:'detached'});
+  assert.equal((await state()).configs[0].strategy.rules.confirmRounds,2);
+  await a.getByRole('button',{name:'立即检查',exact:true}).click();
+  await a.getByText('合格候选 · 1 个',{exact:true}).click();
+  await a.getByRole('cell',{name:'8 / 214 · 24h',exact:true}).waitFor();
+  await a.getByText('高错误率 32.47% ≥ 20% · 7d',{exact:true}).waitFor();
+  await a.getByText('历史不完整',{exact:true}).waitFor();
+  await a.getByLabel('排除平台告警',{exact:true}).check();
+  await a.getByRole('button',{name:'立即检查',exact:true}).click();
+  await a.getByText('合格候选 · 0 个',{exact:true}).waitFor();
+  await a.locator('.exclusions summary').click();
+  await a.locator('.exclusions').getByText('平台告警',{exact:true}).waitFor();
+  await a.getByLabel('排除平台告警',{exact:true}).uncheck();
+  await a.getByRole('button',{name:'暂停',exact:true}).click();
+  await a.getByRole('button',{name:'恢复',exact:true}).click();
+  await a.getByText('仅预览 · 已恢复，等待检查',{exact:true}).waitFor();
+  missingPrice=true;
+  await a.getByRole('button',{name:'立即检查',exact:true}).click();
+  await a.getByText('合格候选 · 1 个',{exact:true}).waitFor();
+  const unavailable=a.locator('.candidate-details tbody');
+  await unavailable.getByText('指定模型真实价格缺失或未就绪',{exact:true}).waitFor();
+  await unavailable.getByText('输入 $2.00',{exact:true}).waitFor();
+  await unavailable.getByText('缓存输入 $0.00',{exact:true}).waitFor();
+  await unavailable.getByText('8 / 214 · 24h',{exact:true}).waitFor();
+  await unavailable.getByText('高错误率 32.47% ≥ 20% · 7d',{exact:true}).waitFor();
+  await unavailable.getByRole('button',{name:'切换到 模拟渠道-2',exact:true}).waitFor();
+  assert.equal(writes,0);assert.equal((await state()).configs[0].automatic,false);
   await send(a,{type:'toggleKey',keyId:7,field:'automatic',enabled:true});
   await Promise.all([send(a,{type:'check'}),send(b,{type:'check'})]);assert.equal(writes,1);
   assert.equal((await state()).states[7].pending,null);
+  missingPrice=false;
   // Journal persistence failure must prevent any network mutation.
   current=1;await send(a,{type:'check'});
   await a.evaluate(()=>window.TEST_STORE_FAIL=true);

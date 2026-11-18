@@ -1,11 +1,11 @@
-import {decide,reconcilePending,migrateApp,validateStrategy,DEFAULT_STRATEGY,PLATFORMS,INTERVAL} from './core.js';
+import {decide,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,DEFAULT_STRATEGY,PLATFORMS,INTERVAL} from './core.js';
 const ORIGIN='https://aihub.top', ALARM='aihub-check';
-const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:7,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
+const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:8,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
 let queue=Promise.resolve();
-const urgentPause=new Set();
+const urgentPause=new Map();
 let disconnectRequested=false;
 function serial(fn) { const p=queue.then(fn,fn); queue=p.catch(()=>{}); return p; }
-async function load(){ const app=(await chrome.storage.local.get('app')).app||initial(); if(migrateApp(app)){log(app,'已升级为可配置排序策略，观察计数已重置');await save(app);} return app; }
+async function load(){ const app=(await chrome.storage.local.get('app')).app||initial(); if(migrateApp(app)){log(app,'已保存每个 Key 当前的策略');await save(app);} return app; }
 async function save(app){await chrome.storage.local.set({app});}
 function log(app,text){app.logs.unshift({at:Date.now(),text});app.logs=app.logs.slice(0,150);}
 async function notice(app,id,text){
@@ -119,7 +119,7 @@ async function check(){
       if(!k || k.status!=='active') {c.paused=true;await notice(app,`missing-${c.keyId}`,`Key ${c.keyId} 不存在或不可用，已暂停`);continue;}
       const previous=app.states[c.keyId]||{};
       const scoped={...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:k.maxRate}))};
-      const plan=decide({config:c,state:previous,currentGroupId:k.groupId,snapshot:scoped,globalStrategy:app.defaultStrategy,intervalMs:(app.checkMinutes||5)*60000});
+      const plan=decide({config:c,state:previous,currentGroupId:k.groupId,snapshot:scoped,intervalMs:(app.checkMinutes||5)*60000});
       app.states[c.keyId]=plan.state;
       if(plan.externalChange)log(app,`Key ${c.keyId} 分组已变化，更新为 ${k.groupId}，下轮继续检查`);
       if(plan.notice)await notice(app,`${plan.notice}-${c.keyId}`,`Key ${c.keyId} 没有合格分组，保留当前分组`);
@@ -131,7 +131,7 @@ async function check(){
         if(!fresh || fresh.groupId!==k.groupId){if(fresh)plan.state.expectedGroupId=fresh.groupId;plan.state.candidate=null;plan.state.count=0;plan.state.status='切换前分组发生变化，等待下轮检查';continue;}
         // Health expires quickly (about 90 seconds in this HAR); re-evaluate before mutation.
         if(fresh.maxRate>0 && scoped.items.find(g=>g.group_id===plan.target)?.rate_multiplier>fresh.maxRate){plan.state.status='倍率上限发生变化，等待下轮';continue;}
-        const again=decide({config:c,state:previous,currentGroupId:fresh.groupId,snapshot:scoped,globalStrategy:app.defaultStrategy,intervalMs:(app.checkMinutes||5)*60000});
+        const again=decide({config:c,state:previous,currentGroupId:fresh.groupId,snapshot:scoped,intervalMs:(app.checkMinutes||5)*60000});
         if(again.target!==plan.target){plan.state.status='切换前条件已变化，等下轮检查';continue;}
         plan.state.pending={from:k.groupId,to:plan.target,at:Date.now()};
         await save(app);
@@ -160,7 +160,13 @@ async function check(){
     await notice(app,`read-${e.message}`,app.lastError);await save(app);
   }
 }
-async function handle(message){
+function dispatch(message){
+  if(['pause','remove','manualSwitch'].includes(message.type))urgentPause.set(message.keyId,Symbol());
+  if(message.type==='disconnect')disconnectRequested=Symbol();
+  const pauseRequest=urgentPause.get(message.keyId),disconnectRequest=disconnectRequested;
+  return serial(()=>handle(message,pauseRequest,disconnectRequest));
+}
+async function handle(message,pauseRequest,disconnectRequest){
   const app=await load();
   if(message.type==='state')return {app,connected:!!(await chrome.storage.session.get('auth')).auth};
   if(message.type==='check'){await check();return {ok:true};}
@@ -177,12 +183,12 @@ async function handle(message){
     if(current.groupId!==message.expectedGroupId)throw new Error('当前分组已变化，请重新检查后再切换');
     const snapshot=await authorizedSnapshot();
     snapshot.items=snapshot.items.map(g=>({...g,key_max_rate_multiplier:current.maxRate}));
-    const plan=decide({config:{...c,paused:false},currentGroupId:current.groupId,snapshot,globalStrategy:app.defaultStrategy});
+    const plan=decide({config:{...c,paused:false},currentGroupId:current.groupId,snapshot});
     if(!plan.state.choices?.some(x=>x.id===message.target))throw new Error('目标已不符合筛选条件，请重新检查');
     if(current.groupId===message.target)return {ok:true};
     const latest=(await keys()).find(x=>x.id===c.keyId);
     if(!latest||latest.groupId!==current.groupId)throw new Error('当前分组已变化，请重新检查');
-    const confirmed=decide({config:{...c,paused:false},currentGroupId:latest.groupId,snapshot:{...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:latest.maxRate}))},globalStrategy:app.defaultStrategy});
+    const confirmed=decide({config:{...c,paused:false},currentGroupId:latest.groupId,snapshot:{...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:latest.maxRate}))}});
     if(!confirmed.state.choices?.some(x=>x.id===message.target))throw new Error('切换前条件已变化，请重新检查');
     if(disconnectRequested)throw new Error('已断开连接，手动切换已取消');
     c.paused=true;
@@ -204,16 +210,17 @@ async function handle(message){
   }
   if(message.type==='configure'){
     if(app.accountMismatch)throw new Error('ACCOUNT');
-    const strategy=message.strategy==null?null:validateStrategy(message.strategy);
     if(!Number.isSafeInteger(message.keyId)||typeof message.platform!=='string'||!message.platform.length||message.platform.length>100||typeof message.model!=='string'||!message.model.length||message.model.length>200)throw new Error('FORMAT');
+    const old=app.configs.find(c=>c.keyId===message.keyId);
+    const strategy=validateStrategy(message.strategy??old?.strategy??app.defaultStrategy);
     await identity(app);
     const k=(await keys()).find(k=>k.id===message.keyId);if(!k)throw new Error('FORMAT');
     const snapshot=await providers();
     if(!snapshot.items.some(g=>g.platform===message.platform && g.group_models?.some(m=>m.model===message.model)))throw new Error('FORMAT');
-    const old=app.configs.find(c=>c.keyId===message.keyId);
     if(app.states[message.keyId]?.pending)throw new Error('请先检查并核实上次切换结果');
     const config={keyId:message.keyId,model:message.model,platform:message.platform,strategy,automatic:message.automatic===true,paused:false};
-    urgentPause.delete(message.keyId);disconnectRequested=false;
+    if(urgentPause.get(message.keyId)===pauseRequest)urgentPause.delete(message.keyId);
+    if(disconnectRequested===disconnectRequest)disconnectRequested=false;
     if(old)Object.assign(old,config);else app.configs.push(config);
     app.states[message.keyId]={expectedGroupId:k.groupId,status:'已保存，等待检查',count:0,lastSwitchAt:app.states[message.keyId]?.lastSwitchAt};
     for(const id of Object.keys(app.notices))if(id.endsWith('-'+message.keyId))delete app.notices[id];
@@ -223,21 +230,23 @@ async function handle(message){
     app.defaultStrategy=validateStrategy(message.strategy);
     const intervalChanged=message.checkMinutes!=null && message.checkMinutes!==(app.checkMinutes||5);
     if(message.checkMinutes!=null){if(!Number.isInteger(message.checkMinutes)||message.checkMinutes<1||message.checkMinutes>60)throw new Error('检查间隔须为1–60分钟的整数');app.checkMinutes=message.checkMinutes;}
-    for(const c of app.configs){
-      if(c.strategy&&!intervalChanged)continue;
-      const s=app.states[c.keyId];
-      if(s){s.candidate=null;s.count=0;delete s.observedAt;delete s.choices; delete s.rateLimitedChoices; delete s.excludedChoices;delete s.excluded;s.status=s.pending?'等待核实上次切换':'全局策略已更新，等待重新检查';}
-    }
-    log(app,'已更新全局排序策略及检查间隔');await save(app);await ensureAlarm();return {ok:true};
+    if(intervalChanged)for(const s of Object.values(app.states))resetStrategyCheck(s,'检查间隔已更新，等待检查');
+    log(app,'已更新新建 Key 的默认策略及检查间隔');await save(app);await ensureAlarm();return {ok:true};
   }
-  if(message.type==='toggleKey'){
+  if(message.type==='keyStrategy'||message.type==='toggleKey'){
     const c=app.configs.find(x=>x.keyId===message.keyId);if(!c)throw new Error('FORMAT');
     if(app.states[c.keyId]?.pending)throw new Error('请先核实上次切换结果');
-    if(message.field==='automatic' && typeof message.enabled==='boolean')c.automatic=message.enabled;
-    else if(message.field==='override' && typeof message.enabled==='boolean')c.strategy=message.enabled?validateStrategy(app.defaultStrategy):null;
-    else if(message.field==='requireDetection' && typeof message.enabled==='boolean')c.strategy=validateStrategy({...c.strategy||app.defaultStrategy,requireDetection:message.enabled});
+    if(message.type==='keyStrategy'){
+      if(!message.strategy)throw new Error('FORMAT');
+      c.strategy=validateStrategy({...message.strategy,requireDetection:c.strategy.requireDetection});
+    }
+    else if(message.field==='automatic' && typeof message.enabled==='boolean')c.automatic=message.enabled;
+    else if(message.field==='requireDetection' && typeof message.enabled==='boolean')c.strategy=validateStrategy({...c.strategy,requireDetection:message.enabled});
+    else if(message.field==='excludeWarnings' && typeof message.enabled==='boolean')c.excludeWarnings=message.enabled;
     else throw new Error('FORMAT');
-    const state=app.states[c.keyId]||{};state.candidate=null;state.count=0;delete state.observedAt;delete state.choices; delete state.rateLimitedChoices; delete state.excludedChoices;delete state.excluded;state.status=c.paused?'已暂停，编辑后恢复':'设置已更新，等待检查';app.states[c.keyId]=state;
+    const state=app.states[c.keyId]||{};
+    resetStrategyCheck(state,c.paused?'已暂停':'设置已更新，等待检查');
+    app.states[c.keyId]=state;
     log(app,`Key ${c.keyId} 设置已更新`);await save(app);return {ok:true};
   }
   if(message.type==='pause'||message.type==='remove'){
@@ -245,6 +254,28 @@ async function handle(message){
     if(message.type==='pause'){c.paused=true;app.states[c.keyId]={...app.states[c.keyId],candidate:null,count:0,status:'已手动暂停'};}
     else{app.configs=app.configs.filter(x=>x!==c);delete app.states[c.keyId];}
     await save(app);return {ok:true};
+  }
+  if(message.type==='resume'){
+    const c=app.configs.find(x=>x.keyId===message.keyId);
+    if(!c)throw new Error('FORMAT');
+    if(app.accountMismatch)throw new Error('ACCOUNT');
+    const state=app.states[c.keyId];
+    if(state?.pending)throw new Error('请先点击“立即检查”，核实上次切换结果');
+    if(!c.paused)return {ok:true};
+    await connectedIdentity(app);
+    const key=(await keys()).find(x=>x.id===c.keyId);
+    if(!key || key.status!=='active')throw new Error('Key 不存在或不可用，无法恢复');
+    if((urgentPause.has(c.keyId) && urgentPause.get(c.keyId)!==pauseRequest) ||
+      (disconnectRequested && disconnectRequested!==disconnectRequest))throw new Error('已收到暂停或断开请求，恢复已取消');
+    c.paused=false;
+    app.states[c.keyId]={expectedGroupId:key.groupId,status:'已恢复，等待检查',count:0,lastSwitchAt:state?.lastSwitchAt};
+    delete app.notices[`missing-${c.keyId}`];
+    delete app.notices[`pending-${c.keyId}`];
+    log(app,`Key ${c.keyId} 已恢复监控`);
+    await save(app);
+    if(urgentPause.get(c.keyId)===pauseRequest)urgentPause.delete(c.keyId);
+    if(disconnectRequested===disconnectRequest)disconnectRequested=false;
+    return {ok:true};
   }
   if(message.type==='disconnect'){
     await chrome.storage.session.remove('auth');for(const c of app.configs)c.paused=true;
@@ -255,9 +286,7 @@ async function handle(message){
 }
 chrome.runtime.onMessage.addListener((message,sender,respond)=>{
   if(sender.id!==chrome.runtime.id || sender.url!==chrome.runtime.getURL('options.html'))return;
-  if(message.type==='pause'||message.type==='remove'||message.type==='manualSwitch')urgentPause.add(message.keyId);
-  if(message.type==='disconnect')disconnectRequested=true;
-  serial(()=>handle(message)).then(result=>respond({result}),e=>respond({error:['AUTH','ACCOUNT','FORMAT','NETWORK','FORBIDDEN','HTTP','BUSINESS','TAB_TIMEOUT'].includes(e.message)?errorText(e):e.message}));return true;
+  dispatch(message).then(result=>respond({result}),e=>respond({error:['AUTH','ACCOUNT','FORMAT','NETWORK','FORBIDDEN','HTTP','BUSINESS','TAB_TIMEOUT'].includes(e.message)?errorText(e):e.message}));return true;
 });
 // Observe only first-party platform requests; never read storage belonging to the website.
 chrome.webRequest.onBeforeSendHeaders.addListener(details=>{

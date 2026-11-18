@@ -16,9 +16,7 @@ const chrome={
   notifications:{create:async()=>{}},
   runtime:{sendMessage:message=>{
     if(!navigator.locks)return Promise.resolve({error:'当前浏览器不支持跨标签页锁，已禁止运行。请使用新版 Chrome 或 Edge。'});
-    if(['pause','remove','manualSwitch'].includes(message.type))urgentPause.add(message.keyId);
-    if(message.type==='disconnect')disconnectRequested=true;
-    return serial(()=>handle(message)).then(result=>({result}),e=>({error:errorText(e)==='检查未完成，本轮停止'?e.message:errorText(e)}));
+    return dispatch(message).then(result=>({result}),e=>({error:errorText(e)==='检查未完成，本轮停止'?e.message:errorText(e)}));
   }}
 };
 async function ensureAlarm(){} // Scheduling is page-based below.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AIHubRouter 渠道优选
 // @namespace    https://github.com/tibbar213/AIHubRouter
-// @version      0.1.2
+// @version      0.1.11
 // @description  一个 key 绑定一个模型；默认仅预览，按明确授权自动优选渠道。
 // @match        https://aihub.top/*
 // @noframes
@@ -18,115 +18,239 @@ if(location.origin!=='https://aihub.top'||window.top!==window.self)return;
 const PLATFORMS = ['openai','kimi','zhipu','grok','deepseek','gemini'];
 const INTERVAL = 300000;
 const PRICE_SOURCE = 'platform-effective-price-v1';
-const DEFAULT_RULES=Object.freeze({minSuccess:0,minSamples:0,maxLatency:0,maxPrice:0,maxRate:0,allowIds:Object.freeze([]),denyIds:Object.freeze([]),confirmRounds:1,cooldownMinutes:0,minImprovement:0});
+const DEFAULT_RULES=Object.freeze({minSuccess:0,minCacheHit:0,minSamples:0,maxLatency:0,maxPrice:0,maxRate:0,allowIds:Object.freeze([]),denyIds:Object.freeze([]),confirmRounds:1,cooldownMinutes:0,minImprovement:0});
 const DEFAULT_STRATEGY = Object.freeze({mode:'price',weights:Object.freeze({price:70,latency:20,success:10}),requireDetection:true,rules:DEFAULT_RULES});
 function validateStrategy(strategy) {
-  if (!strategy || !['price','latency','success','weighted'].includes(strategy.mode)) throw new Error('排序方式无效');
+  if (!strategy || !['price','rate','cacheHit','latency','success','weighted'].includes(strategy.mode)) throw new Error('排序方式无效');
   const weights={...DEFAULT_STRATEGY.weights,...strategy.weights};
   if (!['price','latency','success'].every(k=>typeof weights[k]==='number' && Number.isFinite(weights[k]) && weights[k]>=0 && weights[k]<=100)) throw new Error('权重必须为 0 至 100 的数字');
   if (strategy.mode==='weighted' && weights.price+weights.latency+weights.success<=0) throw new Error('请至少给一个因素设置正权重');
   if(strategy.requireDetection!=null && typeof strategy.requireDetection!=='boolean')throw new Error('模型检测筛选设置无效');
   const rules={...DEFAULT_RULES,...strategy.rules};
-  for(const k of ['minSuccess','minSamples','maxLatency','maxPrice','maxRate','confirmRounds','cooldownMinutes','minImprovement'])if(typeof rules[k]!=='number'||!Number.isFinite(rules[k])||rules[k]<0)throw new Error('筛选和切换数值必须为非负数字');
-  if(rules.minSuccess>100||rules.minImprovement>100||!Number.isInteger(rules.confirmRounds)||rules.confirmRounds<1||rules.confirmRounds>6||!Number.isInteger(rules.minSamples)||rules.cooldownMinutes>1440)throw new Error('成功率/改善幅度应为0–100，确认轮数1–6，样本数为整数，冷却不超过1440分钟');
+  for(const k of ['minSuccess','minCacheHit','minSamples','maxLatency','maxPrice','maxRate','confirmRounds','cooldownMinutes','minImprovement'])if(typeof rules[k]!=='number'||!Number.isFinite(rules[k])||rules[k]<0)throw new Error('筛选和切换数值必须为非负数字');
+  if(rules.minSuccess>100||rules.minCacheHit>100||rules.minImprovement>100||!Number.isInteger(rules.confirmRounds)||rules.confirmRounds<1||rules.confirmRounds>6||!Number.isInteger(rules.minSamples)||rules.cooldownMinutes>1440)throw new Error('成功率/缓存率/改善幅度应为0–100，确认轮数1–6，样本数为整数，冷却不超过1440分钟');
   for(const k of ['allowIds','denyIds']){if(!Array.isArray(rules[k])||rules[k].length>1000||!rules[k].every(x=>Number.isSafeInteger(x)&&x>0))throw new Error('渠道名单请填写正整数分组 ID');rules[k]=[...new Set(rules[k])];}
   return {mode:strategy.mode,weights:{price:weights.price,latency:weights.latency,success:weights.success},requireDetection:strategy.requireDetection!==false,rules};
 }
 function detectionInfo(group,model){
   const d=group.model_detection;
   if(!d)return {passed:false,label:'未检测'};
-  const passed=d.status==='passed' && d.applicable!==false && d.execution_complete!==false;
-  const label=passed?'检测通过':({suspected:'存疑',detection_failed:'检测失败',not_tested:'未检测'})[d.status]||'检测未通过或未完成';
+  const textResult=d.presentation?.text;
+  const isCandyQuestion=typeof textResult?.question==='string' && textResult.question.includes('糖果');
+  const answer=textResult?.answer;
+  const correctAnswer=answer===21 || (typeof answer==='string' && answer.trim()==='21');
+  const candyFailed=isCandyQuestion && (!correctAnswer || textResult.result===false);
+  const passed=d.status==='passed' && d.applicable!==false && d.execution_complete!==false && !candyFailed;
+  const label=candyFailed?'糖果题未通过（答案应为 21）':passed?'检测通过':({suspected:'存疑',detection_failed:'检测失败',not_tested:'未检测'})[d.status]||'检测未通过或未完成';
   return {passed,label:label+(d.model&&d.model!==model?`（检测 ${d.model}）`:'')};
 }
 function strategyLabel(strategy) {
   const s=validateStrategy(strategy);
-  if(s.mode!=='weighted')return {price:'真实价格优先',latency:'首响应更快优先',success:'成功率更高优先'}[s.mode];
+  if(s.mode!=='weighted')return {price:'真实价格优先',rate:'账号倍率优先',cacheHit:'缓存率更高优先',latency:'首响应更快优先',success:'成功率更高优先'}[s.mode];
   const total=Object.values(s.weights).reduce((a,b)=>a+b,0);
   return `加权：价格 ${(s.weights.price/total*100).toFixed(1)}% · 延迟 ${(s.weights.latency/total*100).toFixed(1)}% · 成功率 ${(s.weights.success/total*100).toFixed(1)}%`;
 }
 const validPrice = x => typeof x === 'number' && Number.isFinite(x) && x >= 0;
-function platformPrice(group, model, now=Date.now()) {
+function modelCacheHit(summary,now){
+  const cache=summary?.range_cache,refreshed=Date.parse(cache?.refreshed_at);
+  return cache?.ready===true && cache.coverage_complete===true && cache.stale===false &&
+    Number.isSafeInteger(cache.usage_records) && cache.usage_records>0 &&
+    Number.isFinite(refreshed) && now-refreshed<=INTERVAL && refreshed<=now+60000 &&
+    validPrice(cache.cache_hit_rate) && cache.cache_hit_rate<=1 ? cache.cache_hit_rate : null;
+}
+function cacheRateEstimate(group,model,summary,now){
+  const cacheHit=modelCacheHit(summary,now);
+  if(cacheHit===null)return {reason:'指定模型缓存率未知或数据未就绪'};
+  if(!validPrice(group.rate_multiplier))return {reason:'账号倍率无效，无法估算价格'};
+  // The platform's effective price is SOL-equivalent, not the public USD model price.
+  // Recover its cache-read basis from the exact model's normalized sample cost.
+  const sample=summary.range_cache.pricing_models?.[model];
+  if(!sample || !validPrice(sample.baseline_input_per_million) || !validPrice(sample.sol_equivalent_unit_price) ||
+    !Number.isSafeInteger(sample.usage_records) || sample.usage_records<=0 ||
+    !['input_tokens','cache_read_tokens','cache_creation_tokens'].every(k=>Number.isSafeInteger(sample[k])&&sample[k]>=0))return {reason:'指定模型等效计价基准或样本缺失'};
+  if(sample.cache_creation_tokens!==0 || sample.unknown_context_records!==0 || sample.long_input_tokens!==0 || sample.long_cache_read_tokens!==0 || sample.long_cache_creation_tokens!==0)return {reason:'缓存率估算样本含缓存写入、长上下文或上下文不明确'};
+  const baseline=sample.baseline_input_per_million,total=sample.input_tokens+sample.cache_read_tokens;
+  if(!Number.isSafeInteger(total)||total<=0 || (sample.cache_read_tokens===0&&cacheHit>0))return {reason:'指定模型缓存读取计价基准缺失'};
+  const recovered=sample.cache_read_tokens>0?(sample.sol_equivalent_unit_price*total-baseline*sample.input_tokens)/sample.cache_read_tokens:baseline;
+  if(!Number.isFinite(recovered)||recovered< -1e-9)return {reason:'指定模型等效计价基准不一致'};
+  const cachePrice=Math.max(0,recovered);
+  const cost=group.rate_multiplier*(baseline*(1-cacheHit)+cachePrice*cacheHit);
+  return validPrice(cost)?{cost,predictedMultiplier:null,estimated:true,estimateKind:'cache-rate',sampleCount:summary.range_cache.usage_records,
+    estimateBasis:{inputPrice:baseline,cacheInputPrice:cachePrice,cacheHit,accountMultiplier:group.rate_multiplier}
+  }:{reason:'缓存率估算价格无效'};
+}
+function priceAssessment(group, model, now) {
   // Match ProviderHall's selected-model projection and effectivePrice sort.
   // The predicted multiplier is a companion display value, never another price unit.
   const summary = group.summary_models?.[model];
-  if (!summary) return null;
-  if (summary.range_cache?.stale === true || summary.range_cache?.ready === false) return null;
+  if (!summary) return {reason:'平台未返回指定模型的计价数据'};
+  const cache = summary.range_cache;
+  if (cache?.stale === true) return {reason:'指定模型计价数据已过期'};
   if (!validPrice(summary.effective_input_price_per_million)) {
-    const cache=summary.range_cache, p=cache?.pricing_models?.[model], publicRate=group.public_rate_multiplier??group.rate_multiplier;
-    const refreshed=Date.parse(cache?.refreshed_at);
-    if(summary.effective_multiplier_reason!=='insufficient_samples'||cache?.ready!==true||cache?.coverage_complete!==true||cache?.stale!==false||!Number.isFinite(refreshed)||now-refreshed>INTERVAL||refreshed>now+60000||!p||!Number.isSafeInteger(p.usage_records)||p.usage_records<=0||!validPrice(p.sol_equivalent_unit_price)||!validPrice(publicRate)||!validPrice(group.rate_multiplier)||publicRate!==group.rate_multiplier||p.unknown_context_records!==0||p.long_input_tokens!==0||p.long_cache_read_tokens!==0||p.long_cache_creation_tokens!==0)return null;
-    const cost=p.sol_equivalent_unit_price*publicRate;
-    return validPrice(cost)?{cost,predictedMultiplier:null,estimated:true,sampleCount:p.usage_records}:null;
+    const estimated=cacheRateEstimate(group,model,summary,now);
+    if(!estimated.reason)return estimated;
+    const reason = summary.effective_multiplier_reason;
+    if (reason === 'no_qualifying_requests' || reason === 'no_samples') return {reason:'指定模型没有可计价样本'};
+    if (reason !== 'insufficient_samples') return {reason:modelCacheHit(summary,now)===null?'指定模型真实价格缺失或未就绪':estimated.reason};
+    if (cache?.ready !== true || cache.coverage_complete !== true || cache.stale !== false) return {reason:'指定模型估算数据未就绪或不完整'};
+    const refreshed = Date.parse(cache.refreshed_at);
+    if (!Number.isFinite(refreshed) || now - refreshed > INTERVAL || refreshed > now + 60000) return {reason:'指定模型估算数据过期或时间异常'};
+    const sample = cache.pricing_models?.[model];
+    if (!sample || !Number.isSafeInteger(sample.usage_records) || sample.usage_records <= 0 || !validPrice(sample.sol_equivalent_unit_price)) return {reason:'指定模型估算样本或等效单价缺失'};
+    const publicRate = group.public_rate_multiplier ?? group.rate_multiplier;
+    if (!validPrice(publicRate) || !validPrice(group.rate_multiplier)) return {reason:'渠道倍率无效，无法估算价格'};
+    if (publicRate !== group.rate_multiplier) return {reason:'账号倍率与公开倍率不同，无法估算价格'};
+    if (sample.unknown_context_records !== 0 || sample.long_input_tokens !== 0 || sample.long_cache_read_tokens !== 0 || sample.long_cache_creation_tokens !== 0) return {reason:'估算样本含长上下文或上下文不明确'};
+    const cost = sample.sol_equivalent_unit_price * publicRate;
+    return validPrice(cost) ? {cost,predictedMultiplier:null,estimated:true,sampleCount:sample.usage_records} : {reason:'估算价格无效'};
   }
+  if (cache?.ready === false) return {reason:'指定模型计价数据未就绪'};
   return {
     cost: summary.effective_input_price_per_million,
     predictedMultiplier: summary.effective_multiplier_ready === true && validPrice(summary.effective_multiplier) ? summary.effective_multiplier : null
   };
 }
+function platformPrice(group, model, now=Date.now()) {
+  const result = priceAssessment(group, model, now);
+  return result.reason ? null : result;
+}
 function migrateApp(app) {
-  if (app.schemaVersion === 7) return false;
+  if (app.schemaVersion === 8) return false;
   const previousVersion=app.schemaVersion;
-  delete app.pricing;
-  for (const c of app.configs) delete c.profile;
   app.defaultStrategy=validateStrategy(app.defaultStrategy||DEFAULT_STRATEGY);
   app.checkMinutes=app.checkMinutes||5;
-  for (const c of app.configs) c.strategy=c.strategy ? validateStrategy(c.strategy) : null;
-  if(previousVersion===5){app.defaultStrategy.rules.confirmRounds=1;for(const c of app.configs)if(c.strategy)c.strategy.rules.confirmRounds=1;}
-  if(previousVersion===6)for(const c of app.configs){const s=app.states[c.keyId];if(s&&!s.pending&&c.paused&&/^(检测到外部改组|切换前发现外部改组|检测到页面改组操作|切换期间发生外部改组)，已暂停$/.test(s.status||''))c.paused=false;}
-  for (const s of Object.values(app.states)) {
-    s.candidate=null; s.count=0;
-    delete s.observedAt; delete s.choices; delete s.rateLimitedChoices; delete s.excludedChoices; delete s.excluded;
-    s.status=s.pending?'等待核实上次切换':'排序策略已更新，等待重新检查';
+  if(previousVersion===5)app.defaultStrategy.rules.confirmRounds=1;
+  for(const c of app.configs){
+    c.strategy=validateStrategy(c.strategy||app.defaultStrategy);
+    if(previousVersion===5)c.strategy.rules.confirmRounds=1;
   }
-  app.schemaVersion=7;
+  if(previousVersion!==7){
+    delete app.pricing;
+    for(const c of app.configs){
+      delete c.profile;
+      const s=app.states[c.keyId];
+      if(previousVersion===6&&s&&!s.pending&&c.paused&&/^(检测到外部改组|切换前发现外部改组|检测到页面改组操作|切换期间发生外部改组)，已暂停$/.test(s.status||''))c.paused=false;
+    }
+    for(const s of Object.values(app.states))resetStrategyCheck(s,'排序策略已更新，等待重新检查');
+  }
+  app.schemaVersion=8;
   return true;
+}
+function resetStrategyCheck(state,status){
+  state.candidate=null;
+  state.count=0;
+  delete state.observedAt; delete state.choices; delete state.priceUnavailableChoices;
+  delete state.rateLimitedChoices; delete state.excludedChoices; delete state.excluded;
+  delete state.rankingBasis;
+  state.status=state.pending?'等待核实上次切换':status;
 }
 function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) {
   strategy=validateStrategy(strategy);
   const rules=strategy.rules;
   if (!group || typeof group.platform!=='string' || group.platform!==config.platform) return {reason:'模型系列不匹配'};
   if (snapshot.stale!==false || !Number.isFinite(Date.parse(snapshot.generated_at)) || now-Date.parse(snapshot.generated_at)>INTERVAL || Date.parse(snapshot.generated_at)>now+60000) return {reason:'价格快照未知或过期'};
-  if (group.available!==true || group.availability_unknown===true || group.probe_state!=='enabled' || group.probe_skipped===true) return {reason:'分组不可用或未探测'};
-  if (group.bindable===false) return {reason:'当前账号不可绑定'};
+  if (group.bindable!==true) return {reason:'当前账号不可绑定'};
+  if (group.detections_enabled===false || group.probe_skipped===true) return {reason:'分组未启用探测'};
+  // The Hall listing can hide a bindable group with a healthy model.
+  const requiresGroupProbe=group.detections_enabled!==true && group.probe_state!==undefined;
+  if (requiresGroupProbe && (group.available!==true || group.availability_unknown===true || group.probe_state!=='enabled')) {
+    return {reason:'分组不可用或未探测'};
+  }
   if(rules.denyIds.includes(group.group_id))return {reason:'已在渠道黑名单'};
   if(rules.allowIds.length&&!rules.allowIds.includes(group.group_id))return {reason:'不在渠道白名单'};
   if(rules.maxRate>0 && (!validPrice(group.rate_multiplier)||group.rate_multiplier>rules.maxRate))return {reason:'超过自定义倍率上限'};
   if (group.key_max_rate_multiplier>0 && group.rate_multiplier>group.key_max_rate_multiplier) return {reason:'超过此 key 的倍率上限'};
-  const expires=Date.parse(group.probe_expires_at);
-  if (!Number.isFinite(expires) || expires<=now) return {reason:'分组探测过期'};
+  if (requiresGroupProbe && !(Date.parse(group.probe_expires_at)>now)) return {reason:'分组探测过期'};
   const model=group.group_models?.find(x=>x.model===config.model);
   const card=group.model_cards?.find(x=>x.model===config.model);
-  if (!model || !card || card.probe_state!=='enabled' || card.health!=='healthy') return {reason:'指定模型未列出或不健康'};
+  if (!model || !card || card.health!=='healthy') return {reason:'指定模型未列出或不健康'};
+  if (card.probe_state!=='enabled' && (requiresGroupProbe || card.probe_state!==undefined)) return {reason:'指定模型未启用探测'};
   if (!(Date.parse(card.health_expires_at)>now)) return {reason:'模型健康状态过期'};
   const detection=detectionInfo(group,config.model);
-  if(strategy.requireDetection!==false && !detection.passed)return {reason:detection.label};
+  if(strategy.requireDetection!==false && !detection.passed)return {reason:'检测未通过'};
+  if(config.excludeWarnings===true && providerBadgeDetails(channelSummary(group).hall,now)?.warnings.length)return {reason:'平台告警'};
   if (group.subscription_type!=='standard') return {reason:'非按量分组'};
-  const metric=platformPrice(group,config.model,now);
+  const metric=priceAssessment(group,config.model,now);
   const summary=group.summary_models?.[config.model];
+  const cacheHit=modelCacheHit(summary,now);
   const samples=validPrice(summary?.sample_count)&&Number.isInteger(summary.sample_count)?summary.sample_count:null;
   const latency=samples>0 && validPrice(summary.user_latency_ms) ? summary.user_latency_ms : null;
   const success=samples>0 && validPrice(summary.success_rate) && summary.success_rate<=1 ? summary.success_rate : null;
-  const metrics={price:metric?.cost??null,latency,success};
+  const metrics={price:metric?.cost??null,rate:validPrice(group.rate_multiplier)?group.rate_multiplier:null,cacheHit,latency,success};
+  const missingPrice={reason:metric.reason,priceUnavailable:true,channelPrice:model.price};
   if(rules.minSamples>0 && (samples===null||samples<rules.minSamples))return {reason:'样本数低于下限'};
   if(rules.minSuccess>0 && (success===null || success*100<rules.minSuccess))return {reason:'成功率低于下限或未知'};
+  if(rules.minCacheHit>0 && (cacheHit===null || cacheHit*100<rules.minCacheHit))return {reason:cacheHit===null?'指定模型缓存率未知或数据未就绪':'缓存率低于下限'};
   if(rules.maxLatency>0 && (latency===null || latency>rules.maxLatency))return {reason:'延迟超过上限或未知'};
-  if(rules.maxPrice>0 && (metrics.price===null || metrics.price>rules.maxPrice))return {reason:'真实价格超过上限或未知'};
+  if(rules.maxPrice>0 && metrics.price===null)return missingPrice;
+  if(rules.maxPrice>0 && metrics.price>rules.maxPrice)return {reason:'真实价格超过上限'};
   const required=strategy.mode==='weighted' ? Object.keys(strategy.weights).filter(k=>strategy.weights[k]>0) : [strategy.mode];
-  const missing=required.find(k=>metrics[k]===null);
-  if(missing)return {reason:{price:'指定模型真实价格缺失或未就绪',latency:'指定模型首响应延迟缺失或无样本',success:'指定模型成功率缺失或无样本'}[missing]};
-  return {cost:metrics.price,predictedMultiplier:metric?.predictedMultiplier??null,estimated:metric?.estimated===true,priceSamples:metric?.sampleCount??null,latency,success,metrics,detection:detection.label};
+  const missing=required.find(k=>k!=='price' && metrics[k]===null);
+  if(missing)return {reason:{rate:'账号倍率无效或未知',cacheHit:'指定模型缓存率未知或数据未就绪',latency:'指定模型首响应延迟缺失或无样本',success:'指定模型成功率缺失或无样本'}[missing]};
+  return {cost:metrics.price,predictedMultiplier:metric?.predictedMultiplier??null,estimated:metric?.estimated===true,priceSamples:metric?.sampleCount??null,latency,success,cacheHit,metrics,detection:detection.label,
+    estimateKind:metric.estimateKind,estimateBasis:metric.estimateBasis,priceReason:metric.reason,channelPrice:metric.reason?model.price:undefined
+  };
 }
 function rankChoices(choices,strategy) {
   const s=validateStrategy(strategy);
+  if(s.mode==='price' && choices.length && choices.every(c=>c.metrics.price===null)){
+    const rates=choices.map(c=>c.group.rate_multiplier).filter(validPrice);
+    const min=Math.min(...rates),max=Math.max(...rates);
+    return choices.map(c=>({...c,score:validPrice(c.group.rate_multiplier)?(max===min?100:(max-c.group.rate_multiplier)/(max-min)*100):null}))
+      .sort((a,b)=>(b.score??-1)-(a.score??-1) || a.group.group_id-b.group.group_id);
+  }
   const weights=s.mode==='weighted'?s.weights:{[s.mode]:1};
-  const keys=Object.keys(weights).filter(k=>weights[k]>0),total=keys.reduce((v,k)=>v+weights[k],0);
-  const bounds=Object.fromEntries(keys.map(k=>[k,{min:Math.min(...choices.map(c=>c.metrics[k])),max:Math.max(...choices.map(c=>c.metrics[k]))}]));
+  const priced=weights.price>0?choices.filter(c=>c.metrics.price!==null):[];
+  const comparable=priced.length?priced:choices;
+  const keys=Object.keys(weights).filter(k=>weights[k]>0 && (k!=='price' || priced.length));
+  const total=keys.reduce((v,k)=>v+weights[k],0);
+  const bounds=Object.fromEntries(keys.map(k=>[k,{min:Math.min(...comparable.map(c=>c.metrics[k])),max:Math.max(...comparable.map(c=>c.metrics[k]))}]));
   return choices.map(c=>{
+    if(priced.length && c.metrics.price===null)return {...c,score:null};
     let score=0;
-    for(const k of keys){const {min,max}=bounds[k];const normalized=max===min?1:k==='success'?(c.metrics[k]-min)/(max-min):(max-c.metrics[k])/(max-min);score+=normalized*weights[k]/total*100;}
+    for(const k of keys){const {min,max}=bounds[k];const normalized=max===min?1:['success','cacheHit'].includes(k)?(c.metrics[k]-min)/(max-min):(max-c.metrics[k])/(max-min);score+=normalized*weights[k]/total*100;}
     return {...c,score};
-  }).sort((a,b)=>b.score-a.score || a.group.group_id-b.group.group_id);
+  }).sort((a,b)=>(b.score??-1)-(a.score??-1) || a.group.group_id-b.group.group_id);
+}
+function providerBadgeDetails(hall,now=Date.now()) {
+  const badges=hall?.badges;
+  const fresh=expiresAt=>typeof expiresAt==='string' && Date.parse(expiresAt)>now;
+  if(!badges || !fresh(hall.expiresAt))return null;
+
+  const popularity=badges.popularity;
+  const ranked=popularity?.status==='measured' && fresh(popularity.expires_at) &&
+    Number.isSafeInteger(popularity.rank) && popularity.rank>0 &&
+    Number.isSafeInteger(popularity.groups) && popularity.groups>=popularity.rank &&
+    typeof popularity.window==='string' && popularity.window.length>0;
+  const warnings=[];
+  let partial=false,unknown=!Array.isArray(badges.warnings);
+  for(const warning of Array.isArray(badges.warnings)?badges.warnings:[]){
+    if(typeof warning?.id!=='string' || !Array.isArray(warning.triggers)){
+      unknown=true;
+      continue;
+    }
+    const triggers=warning.triggers.filter(trigger=>trigger && (trigger.expires_at==null || fresh(trigger.expires_at)));
+    partial ||= warning.status==='partial' || warning.partial===true ||
+      triggers.some(trigger=>trigger.complete===false && trigger.available===true);
+    unknown ||= warning.status==='unknown';
+    if(warning.status!=='active')continue;
+    let worst=null;
+    for(const trigger of triggers){
+      if(!validPrice(trigger.value) || !validPrice(trigger.threshold) ||
+        !['<','<=','>','>='].includes(trigger.operator) || typeof trigger.window!=='string' || !trigger.window)continue;
+      if(!worst || (trigger.operator.startsWith('<')?trigger.value<worst.value:trigger.value>worst.value))worst=trigger;
+    }
+    if(worst)warnings.push({id:warning.id,trigger:worst});
+    else unknown=true;
+  }
+  return {popularity:ranked?popularity:null,warnings,partial,unknown};
+}
+function channelSummary(group) {
+  return {
+    id:group.group_id,
+    code:group.code||String(group.group_id),
+    hall:group.badges?{badges:group.badges,expiresAt:group.badges_expires_at}:null
+  };
 }
 function decide({config,state={},currentGroupId,snapshot,now=Date.now(),globalStrategy=DEFAULT_STRATEGY,intervalMs=INTERVAL}) {
   const strategy=validateStrategy(config.strategy||globalStrategy),signature=JSON.stringify(strategy);
@@ -139,14 +263,27 @@ function decide({config,state={},currentGroupId,snapshot,now=Date.now(),globalSt
   next.expectedGroupId=currentGroupId;
   const assessed=(snapshot.items||[]).filter(g=>g.platform===config.platform).map(g=>({group:g,...assess(g,config,snapshot,now,strategy)}));
   next.excluded=Object.fromEntries([...new Set(assessed.filter(x=>x.reason).map(x=>x.reason))].map(reason=>[reason,assessed.filter(x=>x.reason===reason).length]));
+  next.priceUnavailableChoices=assessed.filter(x=>x.priceUnavailable).map(x=>({
+    ...channelSummary(x.group),reason:x.reason,channelPrice:x.channelPrice
+  }));
   const choices=rankChoices(assessed.filter(x=>!x.reason),strategy);
-  next.choices=choices.map(x=>({id:x.group.group_id,code:x.group.code||String(x.group.group_id),cost:x.cost,predictedMultiplier:x.predictedMultiplier,estimated:x.estimated,priceSamples:x.priceSamples,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection}));
+  const rateFallback=strategy.mode==='price' && choices.length>0 && choices.every(x=>x.cost===null);
+  next.rankingBasis=rateFallback?'accountMultiplier':strategy.mode;
+  if(state.rankingBasis!==next.rankingBasis)state={...state,candidate:null,count:0,observedAt:undefined};
+  next.choices=choices.map(x=>({...channelSummary(x.group),cost:x.cost,predictedMultiplier:x.predictedMultiplier,estimated:x.estimated,priceSamples:x.priceSamples,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection,
+    cacheHit:x.cacheHit,estimateKind:x.estimateKind,estimateBasis:x.estimateBasis,priceReason:x.priceReason,channelPrice:x.channelPrice
+  }));
   if (!choices.length) return {...reset('没有合格分组，保留当前'),notice:'no-candidate'};
   const current=choices.find(x=>x.group.group_id===currentGroupId), best=choices[0];
-  if (current && current.score>=best.score-1e-9) return reset('当前分组已是策略最优（同分不切）');
-  if (!current) return {state:{...next,candidate:null,count:0,status:'当前分组不合格，准备切换'},target:best.group.group_id};
+  const usesPrice=strategy.mode==='price' || (strategy.mode==='weighted' && strategy.weights.price>0);
+  const basis=rateFallback?'全部真实价格缺失，按账号倍率：':'';
+  if(rateFallback && best.score===null)return reset('全部真实价格缺失，账号倍率也不可比较，保留当前');
+  if (current?.cost===null && usesPrice && !rateFallback) return reset('当前分组可用，真实价格暂不可比较');
+  if(rateFallback && current && current.score===null)return reset('全部真实价格缺失，当前账号倍率未知，保留当前');
+  if (current && current.score>=best.score-1e-9) return reset(rateFallback?'全部真实价格缺失，当前账号倍率最低（同倍率不切）':strategy.mode==='rate'?'当前账号倍率最低（同倍率不切）':'当前分组已是策略最优（同分不切）');
+  if (!current) return {state:{...next,candidate:null,count:0,status:basis+'当前分组不合格，准备切换'},target:best.group.group_id};
   if(state.lastSwitchAt && now-state.lastSwitchAt<strategy.rules.cooldownMinutes*60000)return reset('切换冷却中');
-  const improvement=strategy.mode==='weighted'?best.score-current.score:strategy.mode==='success'?(best.success-current.success)/Math.max(current.success,1e-12)*100:(current.metrics[strategy.mode]-best.metrics[strategy.mode])/Math.max(current.metrics[strategy.mode],1e-12)*100;
+  const improvement=rateFallback?(current.group.rate_multiplier-best.group.rate_multiplier)/Math.max(current.group.rate_multiplier,1e-12)*100:strategy.mode==='weighted'?best.score-current.score:['success','cacheHit'].includes(strategy.mode)?(best.metrics[strategy.mode]-current.metrics[strategy.mode])/Math.max(current.metrics[strategy.mode],1e-12)*100:(current.metrics[strategy.mode]-best.metrics[strategy.mode])/Math.max(current.metrics[strategy.mode],1e-12)*100;
   if(improvement+1e-9<strategy.rules.minImprovement)return reset('改善幅度未达到要求');
   // Manual checks cannot turn one observation into two consecutive 5-minute observations.
   const consecutive=state.candidate===best.group.group_id && now-state.observedAt>=intervalMs-1000 && now-state.observedAt<=intervalMs*1.6;
@@ -154,7 +291,7 @@ function decide({config,state={},currentGroupId,snapshot,now=Date.now(),globalSt
   const count=tooSoon ? state.count : consecutive ? (state.count||0)+1 : 1;
   const observedAt=tooSoon?state.observedAt:now;
   const ready=count>=strategy.rules.confirmRounds;
-  return {state:{...next,candidate:best.group.group_id,count,observedAt,status:ready?`连续 ${count} 轮策略最优，准备切换`:`等待确认策略最优（${count}/${strategy.rules.confirmRounds}）`},target:ready?best.group.group_id:null};
+  return {state:{...next,candidate:best.group.group_id,count,observedAt,status:basis+(ready?`连续 ${count} 轮策略最优，准备切换`:`等待确认策略最优（${count}/${strategy.rules.confirmRounds}）`)},target:ready?best.group.group_id:null};
 }
 function reconcilePending(state,actual) {
   if (!state.pending) return {state};
@@ -182,9 +319,7 @@ const chrome={
   notifications:{create:async()=>{}},
   runtime:{sendMessage:message=>{
     if(!navigator.locks)return Promise.resolve({error:'当前浏览器不支持跨标签页锁，已禁止运行。请使用新版 Chrome 或 Edge。'});
-    if(['pause','remove','manualSwitch'].includes(message.type))urgentPause.add(message.keyId);
-    if(message.type==='disconnect')disconnectRequested=true;
-    return serial(()=>handle(message)).then(result=>({result}),e=>({error:errorText(e)==='检查未完成，本轮停止'?e.message:errorText(e)}));
+    return dispatch(message).then(result=>({result}),e=>({error:errorText(e)==='检查未完成，本轮停止'?e.message:errorText(e)}));
   }}
 };
 async function ensureAlarm(){} // Scheduling is page-based below.
@@ -224,12 +359,12 @@ function mountPanel(html,css,initialize){
 }
 
 const ORIGIN='https://aihub.top', ALARM='aihub-check';
-const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:7,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
+const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:8,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
 let queue=Promise.resolve();
-const urgentPause=new Set();
+const urgentPause=new Map();
 let disconnectRequested=false;
 function serial(fn) { const run=()=>navigator.locks.request(LOCK,fn); const p=queue.then(run,run); queue=p.catch(()=>{}); return p; }
-async function load(){ const app=(await chrome.storage.local.get('app')).app||initial(); if(migrateApp(app)){log(app,'已升级为可配置排序策略，观察计数已重置');await save(app);} return app; }
+async function load(){ const app=(await chrome.storage.local.get('app')).app||initial(); if(migrateApp(app)){log(app,'已保存每个 Key 当前的策略');await save(app);} return app; }
 async function save(app){await chrome.storage.local.set({app});}
 function log(app,text){app.logs.unshift({at:Date.now(),text});app.logs=app.logs.slice(0,150);}
 async function notice(app,id,text){
@@ -334,7 +469,7 @@ async function check(){
       if(!k || k.status!=='active') {c.paused=true;await notice(app,`missing-${c.keyId}`,`Key ${c.keyId} 不存在或不可用，已暂停`);continue;}
       const previous=app.states[c.keyId]||{};
       const scoped={...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:k.maxRate}))};
-      const plan=decide({config:c,state:previous,currentGroupId:k.groupId,snapshot:scoped,globalStrategy:app.defaultStrategy,intervalMs:(app.checkMinutes||5)*60000});
+      const plan=decide({config:c,state:previous,currentGroupId:k.groupId,snapshot:scoped,intervalMs:(app.checkMinutes||5)*60000});
       app.states[c.keyId]=plan.state;
       if(plan.externalChange)log(app,`Key ${c.keyId} 分组已变化，更新为 ${k.groupId}，下轮继续检查`);
       if(plan.notice)await notice(app,`${plan.notice}-${c.keyId}`,`Key ${c.keyId} 没有合格分组，保留当前分组`);
@@ -346,7 +481,7 @@ async function check(){
         if(!fresh || fresh.groupId!==k.groupId){if(fresh)plan.state.expectedGroupId=fresh.groupId;plan.state.candidate=null;plan.state.count=0;plan.state.status='切换前分组发生变化，等待下轮检查';continue;}
         // Health expires quickly (about 90 seconds in this HAR); re-evaluate before mutation.
         if(fresh.maxRate>0 && scoped.items.find(g=>g.group_id===plan.target)?.rate_multiplier>fresh.maxRate){plan.state.status='倍率上限发生变化，等待下轮';continue;}
-        const again=decide({config:c,state:previous,currentGroupId:fresh.groupId,snapshot:scoped,globalStrategy:app.defaultStrategy,intervalMs:(app.checkMinutes||5)*60000});
+        const again=decide({config:c,state:previous,currentGroupId:fresh.groupId,snapshot:scoped,intervalMs:(app.checkMinutes||5)*60000});
         if(again.target!==plan.target){plan.state.status='切换前条件已变化，等下轮检查';continue;}
         plan.state.pending={from:k.groupId,to:plan.target,at:Date.now()};
         await save(app);
@@ -376,7 +511,13 @@ async function check(){
     await notice(app,`read-${e.message}`,app.lastError);await save(app);
   }
 }
-async function handle(message){
+function dispatch(message){
+  if(['pause','remove','manualSwitch'].includes(message.type))urgentPause.set(message.keyId,Symbol());
+  if(message.type==='disconnect')disconnectRequested=Symbol();
+  const pauseRequest=urgentPause.get(message.keyId),disconnectRequest=disconnectRequested;
+  return serial(()=>handle(message,pauseRequest,disconnectRequest));
+}
+async function handle(message,pauseRequest,disconnectRequest){
   const app=await load();
   if(message.type==='state')return {app,connected:!!(await chrome.storage.session.get('auth')).auth};
   if(message.type==='check'){await check();return {ok:true};}
@@ -393,12 +534,12 @@ async function handle(message){
     if(current.groupId!==message.expectedGroupId)throw new Error('当前分组已变化，请重新检查后再切换');
     const snapshot=await authorizedSnapshot();
     snapshot.items=snapshot.items.map(g=>({...g,key_max_rate_multiplier:current.maxRate}));
-    const plan=decide({config:{...c,paused:false},currentGroupId:current.groupId,snapshot,globalStrategy:app.defaultStrategy});
+    const plan=decide({config:{...c,paused:false},currentGroupId:current.groupId,snapshot});
     if(!plan.state.choices?.some(x=>x.id===message.target))throw new Error('目标已不符合筛选条件，请重新检查');
     if(current.groupId===message.target)return {ok:true};
     const latest=(await keys()).find(x=>x.id===c.keyId);
     if(!latest||latest.groupId!==current.groupId)throw new Error('当前分组已变化，请重新检查');
-    const confirmed=decide({config:{...c,paused:false},currentGroupId:latest.groupId,snapshot:{...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:latest.maxRate}))},globalStrategy:app.defaultStrategy});
+    const confirmed=decide({config:{...c,paused:false},currentGroupId:latest.groupId,snapshot:{...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:latest.maxRate}))}});
     if(!confirmed.state.choices?.some(x=>x.id===message.target))throw new Error('切换前条件已变化，请重新检查');
     if(disconnectRequested)throw new Error('已断开连接，手动切换已取消');
     c.paused=true;
@@ -422,16 +563,17 @@ async function handle(message){
   }
   if(message.type==='configure'){
     if(app.accountMismatch)throw new Error('ACCOUNT');
-    const strategy=message.strategy==null?null:validateStrategy(message.strategy);
     if(!Number.isSafeInteger(message.keyId)||typeof message.platform!=='string'||!message.platform.length||message.platform.length>100||typeof message.model!=='string'||!message.model.length||message.model.length>200)throw new Error('FORMAT');
+    const old=app.configs.find(c=>c.keyId===message.keyId);
+    const strategy=validateStrategy(message.strategy??old?.strategy??app.defaultStrategy);
     await identity(app);
     const k=(await keys()).find(k=>k.id===message.keyId);if(!k)throw new Error('FORMAT');
     const snapshot=await providers();
     if(!snapshot.items.some(g=>g.platform===message.platform && g.group_models?.some(m=>m.model===message.model)))throw new Error('FORMAT');
-    const old=app.configs.find(c=>c.keyId===message.keyId);
     if(app.states[message.keyId]?.pending)throw new Error('请先检查并核实上次切换结果');
     const config={keyId:message.keyId,model:message.model,platform:message.platform,strategy,automatic:message.automatic===true,paused:false};
-    urgentPause.delete(message.keyId);disconnectRequested=false;
+    if(urgentPause.get(message.keyId)===pauseRequest)urgentPause.delete(message.keyId);
+    if(disconnectRequested===disconnectRequest)disconnectRequested=false;
     if(old)Object.assign(old,config);else app.configs.push(config);
     app.states[message.keyId]={expectedGroupId:k.groupId,status:'已保存，等待检查',count:0,lastSwitchAt:app.states[message.keyId]?.lastSwitchAt};
     for(const id of Object.keys(app.notices))if(id.endsWith('-'+message.keyId))delete app.notices[id];
@@ -441,21 +583,23 @@ async function handle(message){
     app.defaultStrategy=validateStrategy(message.strategy);
     const intervalChanged=message.checkMinutes!=null && message.checkMinutes!==(app.checkMinutes||5);
     if(message.checkMinutes!=null){if(!Number.isInteger(message.checkMinutes)||message.checkMinutes<1||message.checkMinutes>60)throw new Error('检查间隔须为1–60分钟的整数');app.checkMinutes=message.checkMinutes;}
-    for(const c of app.configs){
-      if(c.strategy&&!intervalChanged)continue;
-      const s=app.states[c.keyId];
-      if(s){s.candidate=null;s.count=0;delete s.observedAt;delete s.choices; delete s.rateLimitedChoices; delete s.excludedChoices;delete s.excluded;s.status=s.pending?'等待核实上次切换':'全局策略已更新，等待重新检查';}
-    }
-    log(app,'已更新全局排序策略及检查间隔');await save(app);await ensureAlarm();return {ok:true};
+    if(intervalChanged)for(const s of Object.values(app.states))resetStrategyCheck(s,'检查间隔已更新，等待检查');
+    log(app,'已更新新建 Key 的默认策略及检查间隔');await save(app);await ensureAlarm();return {ok:true};
   }
-  if(message.type==='toggleKey'){
+  if(message.type==='keyStrategy'||message.type==='toggleKey'){
     const c=app.configs.find(x=>x.keyId===message.keyId);if(!c)throw new Error('FORMAT');
     if(app.states[c.keyId]?.pending)throw new Error('请先核实上次切换结果');
-    if(message.field==='automatic' && typeof message.enabled==='boolean')c.automatic=message.enabled;
-    else if(message.field==='override' && typeof message.enabled==='boolean')c.strategy=message.enabled?validateStrategy(app.defaultStrategy):null;
-    else if(message.field==='requireDetection' && typeof message.enabled==='boolean')c.strategy=validateStrategy({...c.strategy||app.defaultStrategy,requireDetection:message.enabled});
+    if(message.type==='keyStrategy'){
+      if(!message.strategy)throw new Error('FORMAT');
+      c.strategy=validateStrategy({...message.strategy,requireDetection:c.strategy.requireDetection});
+    }
+    else if(message.field==='automatic' && typeof message.enabled==='boolean')c.automatic=message.enabled;
+    else if(message.field==='requireDetection' && typeof message.enabled==='boolean')c.strategy=validateStrategy({...c.strategy,requireDetection:message.enabled});
+    else if(message.field==='excludeWarnings' && typeof message.enabled==='boolean')c.excludeWarnings=message.enabled;
     else throw new Error('FORMAT');
-    const state=app.states[c.keyId]||{};state.candidate=null;state.count=0;delete state.observedAt;delete state.choices; delete state.rateLimitedChoices; delete state.excludedChoices;delete state.excluded;state.status=c.paused?'已暂停，编辑后恢复':'设置已更新，等待检查';app.states[c.keyId]=state;
+    const state=app.states[c.keyId]||{};
+    resetStrategyCheck(state,c.paused?'已暂停':'设置已更新，等待检查');
+    app.states[c.keyId]=state;
     log(app,`Key ${c.keyId} 设置已更新`);await save(app);return {ok:true};
   }
   if(message.type==='pause'||message.type==='remove'){
@@ -463,6 +607,28 @@ async function handle(message){
     if(message.type==='pause'){c.paused=true;app.states[c.keyId]={...app.states[c.keyId],candidate:null,count:0,status:'已手动暂停'};}
     else{app.configs=app.configs.filter(x=>x!==c);delete app.states[c.keyId];}
     await save(app);return {ok:true};
+  }
+  if(message.type==='resume'){
+    const c=app.configs.find(x=>x.keyId===message.keyId);
+    if(!c)throw new Error('FORMAT');
+    if(app.accountMismatch)throw new Error('ACCOUNT');
+    const state=app.states[c.keyId];
+    if(state?.pending)throw new Error('请先点击“立即检查”，核实上次切换结果');
+    if(!c.paused)return {ok:true};
+    await connectedIdentity(app);
+    const key=(await keys()).find(x=>x.id===c.keyId);
+    if(!key || key.status!=='active')throw new Error('Key 不存在或不可用，无法恢复');
+    if((urgentPause.has(c.keyId) && urgentPause.get(c.keyId)!==pauseRequest) ||
+      (disconnectRequested && disconnectRequested!==disconnectRequest))throw new Error('已收到暂停或断开请求，恢复已取消');
+    c.paused=false;
+    app.states[c.keyId]={expectedGroupId:key.groupId,status:'已恢复，等待检查',count:0,lastSwitchAt:state?.lastSwitchAt};
+    delete app.notices[`missing-${c.keyId}`];
+    delete app.notices[`pending-${c.keyId}`];
+    log(app,`Key ${c.keyId} 已恢复监控`);
+    await save(app);
+    if(urgentPause.get(c.keyId)===pauseRequest)urgentPause.delete(c.keyId);
+    if(disconnectRequested===disconnectRequest)disconnectRequested=false;
+    return {ok:true};
   }
   if(message.type==='disconnect'){
     await GM.setValue(DISCONNECTED,true);disconnected=true;for(const c of app.configs)c.paused=true;
@@ -472,12 +638,12 @@ async function handle(message){
   throw new Error('FORMAT');
 }
 
-mountPanel("<main><header class=\"app-header\"><a class=\"brand\" href=\"#\" aria-label=\"AIHubRouter 首页\"><span class=\"brand-mark\" aria-hidden=\"true\">↗</span><span><strong>AIHubRouter</strong><small>模型渠道优选</small></span></a><button id=\"connection\" class=\"badge\" title=\"打开平台连接设置\">尚未连接</button></header>\r\n<nav class=\"view-nav\" aria-label=\"主导航\"><button data-view=\"monitors\" aria-pressed=\"true\">监控<span id=\"monitorCount\">0</span></button><button data-view=\"settings\" aria-pressed=\"false\">配置</button><button data-view=\"activity\" aria-pressed=\"false\">记录</button></nav>\r\n<div id=\"message\" role=\"status\" aria-live=\"polite\"></div>\r\n<div data-panel=\"monitors\"><section id=\"monitorPanel\" class=\"workspace\"><div class=\"section-head\"><div><span class=\"eyebrow\">OVERVIEW</span><h1>监控列表</h1></div><div class=\"actions\"><button id=\"addKey\" class=\"quiet\">＋ 添加监控</button><button id=\"check\">立即检查</button></div></div><p id=\"lastCheck\" class=\"muted\">默认每 5 分钟检查一次，可自定义间隔和确认轮数。电脑休眠可能延后执行。</p><div id=\"overview\" class=\"overview\" aria-label=\"监控概况\"></div><div id=\"monitors\" class=\"monitors\"></div><p class=\"muted\">每个 key 固定一个模型。平台故障转移保持原设置，实际请求仍可能使用其他分组。手动改组将暂停该 key。</p></section></div>\r\n<div data-panel=\"settings\" hidden><section><h2>连接平台</h2><p>先在当前浏览器打开 AIHub 并登录，再回来读取配置。脚本使用当前网站登录会话；至少保留一个 AIHub 标签页。</p><div class=\"actions\"><a href=\"https://aihub.top\" target=\"_blank\" rel=\"noreferrer\">打开 AIHub ↗</a><button id=\"catalog\">读取 key 与模型</button><button id=\"disconnect\" class=\"quiet\">断开并暂停</button></div><p class=\"muted\">不保存完整 API key 或登录令牌。页面关闭后停止；后台标签页、休眠及节能可能延后检查。多个标签页共用锁，不重复改组。请勿同时启用扩展版自动改组。</p></section>\r\n<section><h2>全局默认策略</h2><p>使用绑定模型的 1h 数据：真实价格、首响应延迟和成功率。健康、可用与数据有效仍是必过门槛。</p><label>排序方式<select id=\"globalMode\"><option value=\"price\">真实价格：低价优先</option><option value=\"latency\">首响应延迟：更快优先</option><option value=\"success\">成功率：更高优先</option><option value=\"weighted\">自定义权重</option></select></label><div id=\"globalWeights\" class=\"grid\" hidden><label>真实价格权重<input id=\"globalPrice\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"70\"></label><label>首响应延迟权重<input id=\"globalLatency\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"20\"></label><label>成功率权重<input id=\"globalSuccess\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"10\"></label><p class=\"muted\">权重会按总和换算为百分比，0 表示忽略该项。各指标在本轮合格候选间换算为 0–100 分后加权；价格和延迟越低越好，成功率越高越好。</p></div><details id=\"globalAdvanced\"><summary>筛选与切换规则</summary><div class=\"grid\"><label>最低成功率（%，0不限制）<input id=\"globalMinSuccess\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"0\"></label><label>最低样本数（0不限制）<input id=\"globalMinSamples\" type=\"number\" min=\"0\" max=\"10000000\" step=\"1\" value=\"0\"></label><label>最高首响应延迟（ms，0不限制）<input id=\"globalMaxLatency\" type=\"number\" min=\"0\" max=\"100000000\" step=\"any\" value=\"0\"></label><label>最高真实价格（0不限制）<input id=\"globalMaxPrice\" type=\"number\" min=\"0\" max=\"1000000\" step=\"any\" value=\"0\"></label><label>最高账号倍率（0不限制）<input id=\"globalMaxRate\" type=\"number\" min=\"0\" max=\"1000000\" step=\"any\" value=\"0\"></label><label>连续确认轮数<input id=\"globalConfirmRounds\" type=\"number\" min=\"1\" max=\"6\" step=\"1\" value=\"1\"></label><label>切换冷却（分钟）<input id=\"globalCooldownMinutes\" type=\"number\" min=\"0\" max=\"1440\" step=\"any\" value=\"0\"></label><label>最小改善幅度（%，0不限制）<input id=\"globalMinImprovement\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"0\"></label><label>渠道白名单（分组 ID，留空不限）<input id=\"globalAllowIds\" type=\"text\" placeholder=\"例如：12, 24\"></label><label>渠道黑名单（分组 ID，留空不限）<input id=\"globalDenyIds\" type=\"text\" placeholder=\"例如：35, 48\"></label></div><p class=\"muted\">名单填分组 ID，用逗号或空格分隔，黑名单优先。硬门槛不因关闭模型检测而取消。冷却与改善幅度用于正常优化，当前渠道不合格时仍直接寻找合格候选。单项模式的改善幅度是相对变化百分比；加权模式是 0–100 分中的分差。</p></details><label>检查间隔（分钟，1–60）<input id=\"checkMinutes\" type=\"number\" min=\"1\" max=\"60\" step=\"1\" value=\"5\"></label><button id=\"saveStrategy\">保存全局策略</button><p class=\"muted\">缺少策略所用指标的候选不参与比较；不使用其他模型数据替代。价格优先使用平台值，数据充分时可使用带标记的估算值。原始倍率是大厅公布倍率，账号倍率为账号专属倍率；没有专属倍率时两者相同。修改策略后重新开始确认。</p></section>\r\n<section><h2>绑定 key 与模型</h2><form id=\"configForm\"><div class=\"grid\"><label>已有 key<select id=\"keyId\" required><option value=\"\">先读取平台数据</option></select></label><label>绑定模型（完整名称）<select id=\"model\" required><option value=\"\">先读取平台数据</option></select></label></div><input type=\"checkbox\" id=\"keyOverride\" hidden><div id=\"keyStrategy\" hidden><label>排序方式<select id=\"keyMode\"><option value=\"price\">真实价格：低价优先</option><option value=\"latency\">首响应延迟：更快优先</option><option value=\"success\">成功率：更高优先</option><option value=\"weighted\">自定义权重</option></select></label><div id=\"keyWeights\" class=\"grid\" hidden><label>真实价格权重<input id=\"keyPrice\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"70\"></label><label>首响应延迟权重<input id=\"keyLatency\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"20\"></label><label>成功率权重<input id=\"keySuccess\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"10\"></label><p class=\"muted\">权重会按总和换算为百分比，0 表示忽略该项。各指标在本轮合格候选间换算为 0–100 分后加权；价格和延迟越低越好，成功率越高越好。</p></div><details id=\"keyAdvanced\"><summary>筛选与切换规则</summary><div class=\"grid\"><label>最低成功率（%，0不限制）<input id=\"keyMinSuccess\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"0\"></label><label>最低样本数（0不限制）<input id=\"keyMinSamples\" type=\"number\" min=\"0\" max=\"10000000\" step=\"1\" value=\"0\"></label><label>最高首响应延迟（ms，0不限制）<input id=\"keyMaxLatency\" type=\"number\" min=\"0\" max=\"100000000\" step=\"any\" value=\"0\"></label><label>最高真实价格（0不限制）<input id=\"keyMaxPrice\" type=\"number\" min=\"0\" max=\"1000000\" step=\"any\" value=\"0\"></label><label>最高账号倍率（0不限制）<input id=\"keyMaxRate\" type=\"number\" min=\"0\" max=\"1000000\" step=\"any\" value=\"0\"></label><label>连续确认轮数<input id=\"keyConfirmRounds\" type=\"number\" min=\"1\" max=\"6\" step=\"1\" value=\"1\"></label><label>切换冷却（分钟）<input id=\"keyCooldownMinutes\" type=\"number\" min=\"0\" max=\"1440\" step=\"any\" value=\"0\"></label><label>最小改善幅度（%，0不限制）<input id=\"keyMinImprovement\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"0\"></label><label>渠道白名单（分组 ID，留空不限）<input id=\"keyAllowIds\" type=\"text\" placeholder=\"例如：12, 24\"></label><label>渠道黑名单（分组 ID，留空不限）<input id=\"keyDenyIds\" type=\"text\" placeholder=\"例如：35, 48\"></label></div><p class=\"muted\">名单填分组 ID，用逗号或空格分隔，黑名单优先。硬门槛不因关闭模型检测而取消。冷却与改善幅度用于正常优化，当前渠道不合格时仍直接寻找合格候选。单项模式的改善幅度是相对变化百分比；加权模式是 0–100 分中的分差。</p></details></div><input type=\"checkbox\" id=\"automatic\" hidden><button type=\"submit\">保存 key 配置</button></form></section></div>\r\n<div data-panel=\"activity\" hidden><section class=\"workspace\"><span class=\"eyebrow\">ACTIVITY</span><h1>最近记录</h1><p class=\"muted\">查看检查、改组与连接状态，最多保留 150 条记录。</p><ol id=\"logs\"></ol><button id=\"resetAccount\" class=\"quiet\">清空账号绑定（需先移除全部监控）</button></section></div>\r\n<footer>AIHubRouter 油猴版 0.1.2 <span>·</span> 只连接 aihub.top</footer>\r\n</main>",":host{font:14px/1.5 \"Segoe UI\",\"Microsoft YaHei\",sans-serif;color-scheme:light;--bg:#f4f6fa;--panel:#fff;--surface:#f7f9fc;--ink:#172238;--muted:#68758b;--line:#e4e9f1;--accent:#3658d4;--accent-soft:#edf1ff;--good:#197757;--good-soft:#eaf7f0;--warn:#956617;--warn-soft:#fff6e2;--danger:#bd4252;--shadow:0 4px 24px #24345205;color:var(--ink);background:var(--bg)}\r\n*{box-sizing:border-box}[hidden]{display:none!important}.panel{margin:0}main{max-width:1320px;margin:auto;padding:0 32px 24px}button,input,select{font:inherit}button,a,input,select,summary{-webkit-tap-highlight-color:transparent}button{border:1px solid transparent;border-radius:9px;background:var(--accent);color:#fff;padding:9px 15px;font-weight:600;cursor:pointer;transition:background .15s,box-shadow .15s}button:hover{filter:brightness(.95)}button:disabled{opacity:.5;cursor:wait}button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #8ba4ff;outline-offset:3px}.quiet{background:var(--panel);color:var(--ink);border-color:var(--line)}.danger{color:var(--danger)}a{color:var(--accent);text-decoration:none}.app-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:26px 0 22px}.brand{display:flex;align-items:center;gap:11px;color:var(--ink)}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:var(--accent);color:white;font-size:25px;font-weight:600}.brand strong{display:block;font-size:18px;letter-spacing:-.5px}.brand small{display:block;color:var(--muted);font-size:11px;letter-spacing:1px}.badge{display:inline-flex;align-items:center;gap:6px;border-radius:6px;padding:4px 9px;background:var(--surface);color:var(--muted);font-size:11px;font-weight:600;white-space:nowrap}.badge.connected,.badge.auto{color:var(--good);background:var(--good-soft)}.badge.preview{color:var(--accent);background:var(--accent-soft)}.badge.paused{color:var(--warn);background:var(--warn-soft)}#connection:before{content:\"\";width:6px;height:6px;border-radius:50%;background:currentColor}.view-nav{display:flex;gap:4px;border-bottom:1px solid var(--line);padding:0 0 14px;margin-bottom:26px}.view-nav button{background:transparent;color:var(--muted);padding:8px 18px}.view-nav button[aria-pressed=true]{color:var(--accent);background:var(--accent-soft)}.view-nav button span{margin-left:7px;font-size:11px;opacity:.7}.workspace{background:transparent;border:0;padding:0;box-shadow:none}section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:25px;margin-bottom:18px;box-shadow:var(--shadow)}h1{font-size:25px;letter-spacing:-.8px;line-height:1.25;margin:5px 0 0}h2{font-size:17px;letter-spacing:-.2px;margin:0 0 16px}h3{font-size:16px;line-height:1.4;margin:0;overflow-wrap:anywhere}h4{margin:18px 0 8px}p{color:var(--muted);line-height:1.7;margin:10px 0 16px}.eyebrow{font-size:10px;font-weight:700;letter-spacing:2px;color:var(--muted)}.muted{font-size:12px;color:var(--muted)}.section-head{display:flex;align-items:center;justify-content:space-between;gap:16px}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.overview{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:20px 0}.stat{border:1px solid var(--line);background:var(--panel);padding:15px 18px;border-radius:12px}.stat strong{display:block;font-size:25px;font-weight:650;line-height:1.2;letter-spacing:-1px}.stat span{font-size:11px;color:var(--muted)}.monitor{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:14px;box-shadow:var(--shadow)}.monitor-top{display:flex;justify-content:space-between;align-items:flex-start;gap:14px}.monitor-name{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.key-label{font-size:11px;color:var(--muted);font-weight:400;letter-spacing:0}.monitor-status{font-size:12px;margin:10px 0 6px}.monitor-meta{font-size:11px;margin:0;color:var(--muted)}.current-summary{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 16px;border-radius:10px;background:var(--surface);margin-top:16px}.current-summary .channel{font-size:13px;font-weight:650;flex:1}.current-summary .price{font-size:20px;font-weight:650;letter-spacing:-.7px;color:var(--accent);font-variant-numeric:tabular-nums}.current-summary .price small{font-size:11px;font-weight:400;color:var(--muted);letter-spacing:0}.monitor-controls{display:flex;gap:8px 18px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:14px;margin-top:16px}.checkbox{display:flex;flex-direction:row;align-items:center;gap:7px;font-size:12px;margin:0;cursor:pointer}.checkbox input{width:15px;height:15px;accent-color:var(--accent);margin:0}.monitor .actions{margin-top:12px}.monitor .actions button{font-size:12px;padding:6px 12px}label{display:flex;flex-direction:column;gap:7px;font-size:12px;font-weight:550;margin-bottom:16px}input[type=number],input[type=text],select{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:10px 11px;max-width:100%;width:100%;min-width:0}input:hover,select:hover{border-color:#aebbd0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 18px}.grid>p{grid-column:1/-1}.grid label{min-width:0}details{border:1px solid var(--line);border-radius:10px;margin:16px 0;background:var(--panel)}details>summary{padding:12px 15px;cursor:pointer;font-size:12px;font-weight:650;list-style:none;display:flex;align-items:center;gap:9px}details>summary:before{content:\"›\";font-size:18px;color:var(--muted);line-height:1;transition:transform .15s}details[open]>summary:before{transform:rotate(90deg)}summary::-webkit-details-marker{display:none}details>.grid,details>p{margin:0 15px 14px}details>.grid{padding-top:4px}.candidate-details{border-color:var(--line)}.candidate-details>p{font-size:11px;margin-top:10px}.exclusions summary{color:var(--muted)}.exclusion-list{display:flex;flex-wrap:wrap;gap:7px;padding:0 15px 14px}.reason-chip{display:inline-flex;gap:9px;align-items:center;background:var(--surface);color:var(--muted);border-radius:6px;padding:5px 8px;font-size:11px}.reason-chip b{color:var(--ink);font-variant-numeric:tabular-nums}.table-wrap{overflow:auto;max-height:520px;margin:0 0 6px;scrollbar-width:thin}table{border-collapse:separate;border-spacing:0;width:100%;font-size:11px;white-space:nowrap;table-layout:auto}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}th:first-child,td:first-child{padding-left:15px}thead{position:sticky;top:0;background:var(--surface);z-index:1}th{font-weight:500}td[data-label=\"真实价格\"]{font-weight:650;color:var(--accent)}td[data-label=\"用户评分\"]{color:var(--warn)}tr.current td{background:var(--accent-soft)}tbody tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--surface)}button.column-sort{padding:0;border-radius:0;background:transparent;color:var(--muted);font-size:11px;font-weight:500}td button{font-size:11px;padding:5px 9px}td .badge{font-size:10px;padding:3px 7px}.compact-sort{display:none}.price-estimate{display:block;font-size:10px;font-weight:400;color:var(--warn);margin-top:2px}#message:empty{display:none}#message:not(:empty){border:1px solid #e9d4a2;background:var(--warn-soft);color:var(--warn);padding:11px 14px;border-radius:9px;margin-bottom:18px;font-size:12px;overflow-wrap:anywhere}#message[data-tone=success]{background:var(--good-soft);border-color:#c4e3d3;color:var(--good)}#message[data-tone=busy]{background:var(--accent-soft);border-color:#d9e1ff;color:var(--accent)}#message[data-tone=error]{background:#fff0f2;border-color:#f0d0d6;color:var(--danger)}#logs{list-style:none;padding:0;max-height:600px;overflow:auto;font-size:12px;color:var(--muted)}#logs li{padding:14px 0;border-bottom:1px solid var(--line);line-height:1.8;overflow-wrap:anywhere}.empty-state{padding:45px 24px;text-align:center;border:1px dashed #cdd6e5;border-radius:14px;background:var(--panel)}.empty-state strong{font-size:17px}.empty-state p{font-size:12px;max-width:360px;margin:10px auto 20px}dialog{border:1px solid var(--line);border-radius:16px;padding:26px;max-width:min(520px,calc(100vw - 32px));background:var(--panel);color:var(--ink);box-shadow:0 20px 80px #17223830}dialog::backdrop{background:#101b3555;backdrop-filter:blur(3px)}footer{text-align:center;color:var(--muted);font-size:10px;padding:18px 0 0}footer span{margin:0 7px}\r\n@media(min-width:1000px){[data-panel=settings]{display:grid;grid-template-columns:320px minmax(0,1fr);gap:18px;align-items:start}[data-panel=settings]>section:first-child{grid-column:1;grid-row:1/3;position:sticky;top:20px}[data-panel=settings]>section{margin:0}[data-panel=settings]>section:nth-child(2),[data-panel=settings]>section:nth-child(3){grid-column:2}}\r\n@media(max-width:760px){main{padding:0 16px 18px}.app-header{padding:18px 0}.view-nav{margin-bottom:20px;padding-bottom:12px}section{padding:18px}.monitor{padding:16px}.section-head{align-items:flex-start}h1{font-size:22px}.section-head>.actions{gap:6px}.section-head>.actions button{padding:7px 10px;font-size:11px}.overview{gap:8px;margin:16px 0}.stat{padding:12px}.stat strong{font-size:22px}.monitor-top{gap:7px}.monitor-name{gap:5px}.monitor h3{font-size:14px}.monitor .badge{font-size:10px}.current-summary{padding:11px 12px}.current-summary .price{font-size:18px}.grid{gap:0 12px}.table-wrap{max-height:540px;padding:0 12px}table,tbody{display:block;width:100%;white-space:normal}.table-wrap thead{display:none}tbody tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 14px;border:1px solid var(--line);border-radius:10px;padding:13px;margin:0 0 10px;background:var(--panel)}tbody tr.current{border-color:#bac8fa;background:var(--accent-soft)}tbody tr td,tbody tr.current td{display:flex;flex-direction:column;align-items:flex-start;padding:0!important;border:0;background:transparent!important;font-size:12px;min-width:0;overflow-wrap:anywhere}tbody td:before{content:attr(data-label);color:var(--muted);font-size:10px;font-weight:400;margin-bottom:2px}tbody td[data-label=\"渠道\"]{grid-column:1/-1;font-weight:650;font-size:13px;flex-direction:row;gap:8px}tbody td[data-label=\"渠道\"]:before{display:none}tbody td[data-label=\"真实价格\"]{grid-column:1/-1;grid-row:2;font-size:18px}tbody td[data-label=\"操作\"]{grid-column:1/-1;flex-direction:row;justify-content:flex-end}tbody td[data-label=\"操作\"]:before{display:none}td button{padding:6px 15px}.compact-sort{display:flex;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px;margin:0 0 12px;font-weight:400;color:var(--muted)}.compact-sort select{width:auto;max-width:72%;padding:6px 8px;font-size:11px}.exclusion-list{flex-direction:column}.reason-chip{justify-content:space-between}.monitor-controls{gap:10px 16px}.monitor-meta{line-height:1.8}.monitor-status{line-height:1.6}.monitor .muted{font-size:11px}}\r\n@media(max-width:400px){main{padding:0 12px 14px}.brand strong{font-size:16px}.brand-mark{width:32px;height:32px}.brand small{font-size:10px}.view-nav button{flex:1;padding:8px 10px}.grid{grid-template-columns:1fr}.section-head{flex-wrap:wrap}.section-head>.actions{width:100%;justify-content:flex-end}.monitor-top{flex-wrap:wrap}.stat span{font-size:10px}.current-summary{gap:8px}.current-summary .channel{flex-basis:100%}}\r\n@media(prefers-color-scheme:dark){:host{color-scheme:dark;--bg:#111723;--panel:#192131;--surface:#202b3e;--ink:#e2e9f5;--muted:#97a6bd;--line:#2a364a;--accent:#92aaff;--accent-soft:#273354;--good:#81d7b2;--good-soft:#203c34;--warn:#e5be73;--warn-soft:#3a3223;--danger:#f394a1}button{background:#4767dc;color:#fff}.quiet{background:var(--surface);color:var(--ink)}#message[data-tone=error]{background:#3d2730;border-color:#68404d}.brand-mark{background:#4767dc}#message[data-tone=success],#message[data-tone=busy]{border-color:var(--line)}}\r\n@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}\r\n",document=>{
+mountPanel("<main><header class=\"app-header\"><a class=\"brand\" href=\"#\" aria-label=\"AIHubRouter 首页\"><span class=\"brand-mark\" aria-hidden=\"true\">↗</span><span><strong>AIHubRouter</strong><small>模型渠道优选</small></span></a><button id=\"connection\" class=\"badge\" title=\"打开平台连接设置\">尚未连接</button></header>\r\n<nav class=\"view-nav\" aria-label=\"主导航\"><button data-view=\"monitors\" aria-pressed=\"true\">监控<span id=\"monitorCount\">0</span></button><button data-view=\"settings\" aria-pressed=\"false\">配置</button><button data-view=\"activity\" aria-pressed=\"false\">记录</button></nav>\r\n<div id=\"message\" role=\"status\" aria-live=\"polite\"></div>\r\n<div data-panel=\"monitors\"><section id=\"monitorPanel\" class=\"workspace\"><div class=\"section-head\"><div><span class=\"eyebrow\">OVERVIEW</span><h1>监控列表</h1></div><div class=\"actions\"><button id=\"addKey\" class=\"quiet\">＋ 添加监控</button><button id=\"check\">立即检查</button></div></div><p id=\"lastCheck\" class=\"muted\">默认每 5 分钟检查一次，可自定义间隔和确认轮数。电脑休眠可能延后执行。</p><div id=\"overview\" class=\"overview\" aria-label=\"监控概况\"></div><div id=\"monitors\" class=\"monitors\"></div><p class=\"muted\">每个 key 固定一个模型。平台故障转移保持原设置，实际请求仍可能使用其他分组。手动改组将暂停该 key。</p></section></div>\r\n<div data-panel=\"settings\" hidden><section><h2>连接平台</h2><p>先在当前浏览器打开 AIHub 并登录，再回来读取配置。脚本使用当前网站登录会话；至少保留一个 AIHub 标签页。</p><div class=\"actions\"><a href=\"https://aihub.top\" target=\"_blank\" rel=\"noreferrer\">打开 AIHub ↗</a><button id=\"catalog\">读取 key 与模型</button><button id=\"disconnect\" class=\"quiet\">断开并暂停</button></div><p class=\"muted\">不保存完整 API key 或登录令牌。页面关闭后停止；后台标签页、休眠及节能可能延后检查。多个标签页共用锁，不重复改组。请勿同时启用扩展版自动改组。</p></section>\r\n<section><h2>新建 Key 的默认策略</h2><p>添加监控时复制这套策略。在监控卡片里调整各 Key 的策略。</p><form id=\"defaultStrategyForm\"><label class=\"checkbox\"><input name=\"requireDetection\" type=\"checkbox\" checked>新建 Key 默认排除检测未通过</label><label>检查间隔（分钟，1–60）<input id=\"checkMinutes\" type=\"number\" min=\"1\" max=\"60\" step=\"1\" value=\"5\"></label><button type=\"submit\">保存默认策略与检查间隔</button></form><p class=\"muted\">缺少真实价格的渠道仍可入选。真实价格优先策略在全部合格渠道缺价时按账号倍率选择，同倍率保留当前渠道。设定最高真实价格时，候选必须有可比较的价格。优先使用平台真实价格，缺失时按指定模型缓存率、账号倍率和平台等效计价基准估算，并标明估算来源；最低缓存率继续先作为筛选门槛。参与策略的延迟和成功率必须有指定模型的数据。原始倍率是大厅公布倍率，账号倍率为账号专属倍率；没有专属倍率时两者相同。修改策略后重新开始确认。</p></section>\r\n<section><h2>绑定 key 与模型</h2><form id=\"configForm\"><div class=\"grid\"><label>已有 key<select id=\"keyId\" required><option value=\"\">先读取平台数据</option></select></label><label>绑定模型（完整名称）<select id=\"model\" required><option value=\"\">先读取平台数据</option></select></label></div><input type=\"checkbox\" id=\"automatic\" hidden><button type=\"submit\">保存 key 配置</button></form></section></div>\r\n<div data-panel=\"activity\" hidden><section class=\"workspace\"><span class=\"eyebrow\">ACTIVITY</span><h1>最近记录</h1><p class=\"muted\">查看检查、改组与连接状态，最多保留 150 条记录。</p><ol id=\"logs\"></ol><button id=\"resetAccount\" class=\"quiet\">清空账号绑定（需先移除全部监控）</button></section></div>\r\n<template id=\"strategyFields\"><label>排序方式<select name=\"mode\"><option value=\"price\">真实价格：低价优先</option><option value=\"rate\">账号倍率：低倍率优先</option><option value=\"cacheHit\">缓存率：更高优先</option><option value=\"latency\">首响应延迟：更快优先</option><option value=\"success\">成功率：更高优先</option><option value=\"weighted\">自定义权重</option></select></label><div data-weights class=\"grid\" hidden><label>真实价格权重<input name=\"price\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"70\"></label><label>首响应延迟权重<input name=\"latency\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"20\"></label><label>成功率权重<input name=\"success\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"10\"></label><p class=\"muted\">权重会按总和换算为百分比，0 表示忽略该项。各指标在本轮合格候选间换算为 0–100 分后加权；价格和延迟越低越好，成功率越高越好。</p></div><details><summary>筛选与切换规则</summary><div class=\"grid\"><label>最低成功率（%，0不限制）<input name=\"minSuccess\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"0\"></label><label>最低缓存率（%，0不限制）<input name=\"minCacheHit\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"0\"></label><label>最低样本数（0不限制）<input name=\"minSamples\" type=\"number\" min=\"0\" max=\"10000000\" step=\"1\" value=\"0\"></label><label>最高首响应延迟（ms，0不限制）<input name=\"maxLatency\" type=\"number\" min=\"0\" max=\"100000000\" step=\"any\" value=\"0\"></label><label>最高真实价格（0不限制）<input name=\"maxPrice\" type=\"number\" min=\"0\" max=\"1000000\" step=\"any\" value=\"0\"></label><label>最高账号倍率（0不限制）<input name=\"maxRate\" type=\"number\" min=\"0\" max=\"1000000\" step=\"any\" value=\"0\"></label><label>连续确认轮数<input name=\"confirmRounds\" type=\"number\" min=\"1\" max=\"6\" step=\"1\" value=\"1\"></label><label>切换冷却（分钟）<input name=\"cooldownMinutes\" type=\"number\" min=\"0\" max=\"1440\" step=\"any\" value=\"0\"></label><label>最小改善幅度（%，0不限制）<input name=\"minImprovement\" type=\"number\" min=\"0\" max=\"100\" step=\"any\" value=\"0\"></label><label>渠道白名单（分组 ID，留空不限）<input name=\"allowIds\" type=\"text\" placeholder=\"例如：12, 24\"></label><label>渠道黑名单（分组 ID，留空不限）<input name=\"denyIds\" type=\"text\" placeholder=\"例如：35, 48\"></label></div><p class=\"muted\">缓存率采用指定模型的 1h 缓存命中率；开启门槛后，数据缺失、未就绪或过期的渠道会被排除。名单填分组 ID，用逗号或空格分隔，黑名单优先。硬门槛不因关闭模型检测而取消。冷却与改善幅度用于正常优化，当前渠道不合格时仍直接寻找合格候选。单项模式的改善幅度是相对变化百分比；加权模式是 0–100 分中的分差。</p></details></template>\r\n<footer>AIHubRouter 油猴版 0.1.11 <span>·</span> 只连接 aihub.top</footer>\r\n</main>",":host{font:14px/1.5 \"Segoe UI\",\"Microsoft YaHei\",sans-serif;color-scheme:light;--bg:#f4f6fa;--panel:#fff;--surface:#f7f9fc;--ink:#172238;--muted:#68758b;--line:#e4e9f1;--accent:#3658d4;--accent-soft:#edf1ff;--good:#197757;--good-soft:#eaf7f0;--warn:#956617;--warn-soft:#fff6e2;--danger:#bd4252;--shadow:0 4px 24px #24345205;color:var(--ink);background:var(--bg)}\r\n*{box-sizing:border-box}[hidden]{display:none!important}.panel{margin:0}main{max-width:1320px;margin:auto;padding:0 32px 24px}button,input,select{font:inherit}button,a,input,select,summary{-webkit-tap-highlight-color:transparent}button{border:1px solid transparent;border-radius:9px;background:var(--accent);color:#fff;padding:9px 15px;font-weight:600;cursor:pointer;transition:background .15s,box-shadow .15s}button:hover{filter:brightness(.95)}button:disabled{opacity:.5;cursor:wait}button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #8ba4ff;outline-offset:3px}.quiet{background:var(--panel);color:var(--ink);border-color:var(--line)}.danger{color:var(--danger)}a{color:var(--accent);text-decoration:none}.app-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:26px 0 22px}.brand{display:flex;align-items:center;gap:11px;color:var(--ink)}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:var(--accent);color:white;font-size:25px;font-weight:600}.brand strong{display:block;font-size:18px;letter-spacing:-.5px}.brand small{display:block;color:var(--muted);font-size:11px;letter-spacing:1px}.badge{display:inline-flex;align-items:center;gap:6px;border-radius:6px;padding:4px 9px;background:var(--surface);color:var(--muted);font-size:11px;font-weight:600;white-space:nowrap}.badge.connected,.badge.auto{color:var(--good);background:var(--good-soft)}.badge.preview{color:var(--accent);background:var(--accent-soft)}.badge.paused{color:var(--warn);background:var(--warn-soft)}#connection:before{content:\"\";width:6px;height:6px;border-radius:50%;background:currentColor}.view-nav{display:flex;gap:4px;border-bottom:1px solid var(--line);padding:0 0 14px;margin-bottom:26px}.view-nav button{background:transparent;color:var(--muted);padding:8px 18px}.view-nav button[aria-pressed=true]{color:var(--accent);background:var(--accent-soft)}.view-nav button span{margin-left:7px;font-size:11px;opacity:.7}.workspace{background:transparent;border:0;padding:0;box-shadow:none}section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:25px;margin-bottom:18px;box-shadow:var(--shadow)}h1{font-size:25px;letter-spacing:-.8px;line-height:1.25;margin:5px 0 0}h2{font-size:17px;letter-spacing:-.2px;margin:0 0 16px}h3{font-size:16px;line-height:1.4;margin:0;overflow-wrap:anywhere}h4{margin:18px 0 8px}p{color:var(--muted);line-height:1.7;margin:10px 0 16px}.eyebrow{font-size:10px;font-weight:700;letter-spacing:2px;color:var(--muted)}.muted{font-size:12px;color:var(--muted)}.section-head{display:flex;align-items:center;justify-content:space-between;gap:16px}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.overview{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:20px 0}.stat{border:1px solid var(--line);background:var(--panel);padding:15px 18px;border-radius:12px}.stat strong{display:block;font-size:25px;font-weight:650;line-height:1.2;letter-spacing:-1px}.stat span{font-size:11px;color:var(--muted)}.monitor{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:14px;box-shadow:var(--shadow)}.monitor-top{display:flex;justify-content:space-between;align-items:flex-start;gap:14px}.monitor-name{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.key-label{font-size:11px;color:var(--muted);font-weight:400;letter-spacing:0}.monitor-status{font-size:12px;margin:10px 0 6px}.monitor-meta{font-size:11px;margin:0;color:var(--muted)}.current-summary{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 16px;border-radius:10px;background:var(--surface);margin-top:16px}.current-summary .channel{font-size:13px;font-weight:650;flex:1}.current-summary .price{font-size:20px;font-weight:650;letter-spacing:-.7px;color:var(--accent);font-variant-numeric:tabular-nums}.current-summary .price small{font-size:11px;font-weight:400;color:var(--muted);letter-spacing:0}.monitor-controls{display:flex;gap:8px 18px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:14px;margin-top:16px}.checkbox{display:flex;flex-direction:row;align-items:center;gap:7px;font-size:12px;margin:0;cursor:pointer}.checkbox input{width:15px;height:15px;accent-color:var(--accent);margin:0}.monitor .actions{margin-top:12px}.monitor .actions button{font-size:12px;padding:6px 12px}label{display:flex;flex-direction:column;gap:7px;font-size:12px;font-weight:550;margin-bottom:16px}input[type=number],input[type=text],select{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:10px 11px;max-width:100%;width:100%;min-width:0}input:hover,select:hover{border-color:#aebbd0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 18px}.grid>p{grid-column:1/-1}.grid label{min-width:0}details{border:1px solid var(--line);border-radius:10px;margin:16px 0;background:var(--panel)}details>summary{padding:12px 15px;cursor:pointer;font-size:12px;font-weight:650;list-style:none;display:flex;align-items:center;gap:9px}details>summary:before{content:\"›\";font-size:18px;color:var(--muted);line-height:1;transition:transform .15s}details[open]>summary:before{transform:rotate(90deg)}summary::-webkit-details-marker{display:none}details>.grid,details>p{margin:0 15px 14px}details>.grid{padding-top:4px}.candidate-details{border-color:var(--line)}.candidate-details>p{font-size:11px;margin-top:10px}.exclusions summary{color:var(--muted)}.exclusion-list{display:flex;flex-wrap:wrap;gap:7px;padding:0 15px 14px}.reason-chip{display:inline-flex;gap:9px;align-items:center;background:var(--surface);color:var(--muted);border-radius:6px;padding:5px 8px;font-size:11px}.reason-chip b{color:var(--ink);font-variant-numeric:tabular-nums}.table-wrap{overflow:auto;max-height:520px;margin:0 0 6px;scrollbar-width:thin}table{border-collapse:separate;border-spacing:0;width:100%;font-size:11px;white-space:nowrap;table-layout:auto}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}th:first-child,td:first-child{padding-left:15px}thead{position:sticky;top:0;background:var(--surface);z-index:1}th{font-weight:500}td[data-label=\"真实价格\"]{font-weight:650;color:var(--accent)}td[data-label=\"用户评分\"]{color:var(--warn)}tr.current td{background:var(--accent-soft)}tbody tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--surface)}button.column-sort{padding:0;border-radius:0;background:transparent;color:var(--muted);font-size:11px;font-weight:500}td button{font-size:11px;padding:5px 9px}td .badge{font-size:10px;padding:3px 7px}.compact-sort{display:none}.price-estimate{display:block;font-size:10px;font-weight:400;color:var(--warn);margin-top:2px}#message:empty{display:none}#message:not(:empty){border:1px solid #e9d4a2;background:var(--warn-soft);color:var(--warn);padding:11px 14px;border-radius:9px;margin-bottom:18px;font-size:12px;overflow-wrap:anywhere}#message[data-tone=success]{background:var(--good-soft);border-color:#c4e3d3;color:var(--good)}#message[data-tone=busy]{background:var(--accent-soft);border-color:#d9e1ff;color:var(--accent)}#message[data-tone=error]{background:#fff0f2;border-color:#f0d0d6;color:var(--danger)}#logs{list-style:none;padding:0;max-height:600px;overflow:auto;font-size:12px;color:var(--muted)}#logs li{padding:14px 0;border-bottom:1px solid var(--line);line-height:1.8;overflow-wrap:anywhere}.empty-state{padding:45px 24px;text-align:center;border:1px dashed #cdd6e5;border-radius:14px;background:var(--panel)}.empty-state strong{font-size:17px}.empty-state p{font-size:12px;max-width:360px;margin:10px auto 20px}dialog{border:1px solid var(--line);border-radius:16px;padding:26px;max-width:min(520px,calc(100vw - 32px));background:var(--panel);color:var(--ink);box-shadow:0 20px 80px #17223830}dialog::backdrop{background:#101b3555;backdrop-filter:blur(3px)}footer{text-align:center;color:var(--muted);font-size:10px;padding:18px 0 0}footer span{margin:0 7px}\r\n@media(min-width:1000px){[data-panel=settings]{display:grid;grid-template-columns:320px minmax(0,1fr);gap:18px;align-items:start}[data-panel=settings]>section:first-child{grid-column:1;grid-row:1/3;position:sticky;top:20px}[data-panel=settings]>section{margin:0}[data-panel=settings]>section:nth-child(2),[data-panel=settings]>section:nth-child(3){grid-column:2}}\r\n@media(max-width:760px){main{padding:0 16px 18px}.app-header{padding:18px 0}.view-nav{margin-bottom:20px;padding-bottom:12px}section{padding:18px}.monitor{padding:16px}.section-head{align-items:flex-start}h1{font-size:22px}.section-head>.actions{gap:6px}.section-head>.actions button{padding:7px 10px;font-size:11px}.overview{gap:8px;margin:16px 0}.stat{padding:12px}.stat strong{font-size:22px}.monitor-top{gap:7px}.monitor-name{gap:5px}.monitor h3{font-size:14px}.monitor .badge{font-size:10px}.current-summary{padding:11px 12px}.current-summary .price{font-size:18px}.grid{gap:0 12px}.table-wrap{max-height:540px;padding:0 12px}table,tbody{display:block;width:100%;white-space:normal}.table-wrap thead{display:none}tbody tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 14px;border:1px solid var(--line);border-radius:10px;padding:13px;margin:0 0 10px;background:var(--panel)}tbody tr.current{border-color:#bac8fa;background:var(--accent-soft)}tbody tr td,tbody tr.current td{display:flex;flex-direction:column;align-items:flex-start;padding:0!important;border:0;background:transparent!important;font-size:12px;min-width:0;overflow-wrap:anywhere}tbody td:before{content:attr(data-label);color:var(--muted);font-size:10px;font-weight:400;margin-bottom:2px}tbody td[data-label=\"渠道\"]{grid-column:1/-1;font-weight:650;font-size:13px;flex-direction:row;gap:8px}tbody td[data-label=\"渠道\"]:before{display:none}tbody td[data-label=\"真实价格\"]{grid-column:1/-1;grid-row:2;font-size:18px}tbody td[data-label=\"操作\"]{grid-column:1/-1;flex-direction:row;justify-content:flex-end}tbody td[data-label=\"操作\"]:before{display:none}td button{padding:6px 15px}.compact-sort{display:flex;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px;margin:0 0 12px;font-weight:400;color:var(--muted)}.compact-sort select{width:auto;max-width:72%;padding:6px 8px;font-size:11px}.exclusion-list{flex-direction:column}.reason-chip{justify-content:space-between}.monitor-controls{gap:10px 16px}.monitor-meta{line-height:1.8}.monitor-status{line-height:1.6}.monitor .muted{font-size:11px}}\r\n@media(max-width:400px){main{padding:0 12px 14px}.brand strong{font-size:16px}.brand-mark{width:32px;height:32px}.brand small{font-size:10px}.view-nav button{flex:1;padding:8px 10px}.grid{grid-template-columns:1fr}.section-head{flex-wrap:wrap}.section-head>.actions{width:100%;justify-content:flex-end}.monitor-top{flex-wrap:wrap}.stat span{font-size:10px}.current-summary{gap:8px}.current-summary .channel{flex-basis:100%}}\r\n@media(prefers-color-scheme:dark){:host{color-scheme:dark;--bg:#111723;--panel:#192131;--surface:#202b3e;--ink:#e2e9f5;--muted:#97a6bd;--line:#2a364a;--accent:#92aaff;--accent-soft:#273354;--good:#81d7b2;--good-soft:#203c34;--warn:#e5be73;--warn-soft:#3a3223;--danger:#f394a1}button{background:#4767dc;color:#fff}.quiet{background:var(--surface);color:var(--ink)}#message[data-tone=error]{background:#3d2730;border-color:#68404d}.brand-mark{background:#4767dc}#message[data-tone=success],#message[data-tone=busy]{border-color:var(--line)}}\r\n@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}\r\n\n.key-strategy-editor{border-top:1px solid var(--line);margin-top:16px;padding-top:2px}\n",document=>{
 const window={scrollTo:()=>document.body.scrollTo({top:0})};
 const $=id=>document.getElementById(id);
 let catalog={keys:[],models:[]},app,globalLoaded=false;
 let appliedCatalogAt=0;
-const editorDetection={global:true,key:true};
+const defaultEditor=$('defaultStrategyForm');
 function showView(view){
   for(const panel of document.querySelectorAll('[data-panel]'))panel.hidden=panel.dataset.panel!==view;
   for(const button of document.querySelectorAll('[data-view]'))button.setAttribute('aria-pressed',String(button.dataset.view===view));
@@ -486,7 +652,7 @@ function showView(view){
 for(const button of document.querySelectorAll('[data-view]'))button.onclick=()=>showView(button.dataset.view);
 document.querySelector('.brand').onclick=e=>{e.preventDefault();showView('monitors');};
 function addMonitor(){
-  $('keyId').value='';$('model').value='';$('automatic').checked=false;$('keyOverride').checked=false;setEditor('key',app?.defaultStrategy||DEFAULT_STRATEGY);
+  $('keyId').value='';$('model').value='';$('automatic').checked=false;
   showView('settings');$('configForm').scrollIntoView({behavior:'smooth',block:'center'});
 }
 $('addKey').onclick=addMonitor;
@@ -494,35 +660,122 @@ $('connection').onclick=()=>showView('settings');
 const viewSort=new Map();
 const expandedCandidates=new Set();
 const expandedExclusions=new Set();
+const strategyEditors=new Map();
 let messageTimer;
-const ruleInputs={MinSuccess:'minSuccess',MinSamples:'minSamples',MaxLatency:'maxLatency',MaxPrice:'maxPrice',MaxRate:'maxRate',ConfirmRounds:'confirmRounds',CooldownMinutes:'cooldownMinutes',MinImprovement:'minImprovement'};
+const ruleInputs=['minSuccess','minCacheHit','minSamples','maxLatency','maxPrice','maxRate','confirmRounds','cooldownMinutes','minImprovement'];
+const weightInputs=['price','latency','success'];
 async function send(message){let timer;const limit=message.type==='catalog'?35000:message.type==='state'?6000:0;const request=chrome.runtime.sendMessage(message);const reply=limit?await Promise.race([request,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('连接耗时过长，请检查 AIHub 登录状态和网络后重试。')),limit);})]).finally(()=>clearTimeout(timer)):await request;if(reply?.error)throw new Error(reply.error);if(!reply)throw new Error('插件后台未响应');return reply.result;}
 function node(tag,text,cls){const e=document.createElement(tag);if(text!=null)e.textContent=text;if(cls)e.className=cls;return e;}
 function option(select,value,text){const o=node('option',text);o.value=value;select.append(o);}
-function toggleEditor(prefix){
-  const enabled=prefix!=='key'||$('keyOverride').checked;
-  const weighted=$(prefix+'Mode').value==='weighted';
-  $(prefix+'Weights').hidden=!weighted;
-  for(const name of ['Price','Latency','Success'])$(prefix+name).disabled=!enabled||!weighted;
-  if(prefix==='key'){$('keyStrategy').hidden=!enabled;$('keyMode').disabled=!enabled;}
-  if(prefix==='key')for(const input of $('keyAdvanced').querySelectorAll('input'))input.disabled=!enabled;
+function attachStrategyFields(form,strategy){
+  form.prepend($('strategyFields').content.cloneNode(true));
+  const fields=form.elements,s=validateStrategy(strategy);
+  fields.mode.value=s.mode;
+  for(const key of ruleInputs)fields[key].value=s.rules[key];
+  for(const key of ['allowIds','denyIds'])fields[key].value=s.rules[key].join(', ');
+  for(const key of weightInputs)fields[key].value=s.weights[key];
+  const toggleWeights=()=>{
+    const weighted=fields.mode.value==='weighted';
+    form.querySelector('[data-weights]').hidden=!weighted;
+    for(const key of weightInputs)fields[key].disabled=!weighted;
+  };
+  fields.mode.onchange=toggleWeights;
+  toggleWeights();
 }
-function setEditor(prefix,strategy){
-  const s=validateStrategy(strategy||DEFAULT_STRATEGY);$(prefix+'Mode').value=s.mode;
-  editorDetection[prefix]=s.requireDetection;
-  for(const [id,key] of Object.entries(ruleInputs))$(prefix+id).value=s.rules[key];
-  for(const id of ['AllowIds','DenyIds'])$(prefix+id).value=s.rules[id==='AllowIds'?'allowIds':'denyIds'].join(', ');
-  for(const [name,key] of [['Price','price'],['Latency','latency'],['Success','success']])$(prefix+name).value=s.weights[key];
-  toggleEditor(prefix);
+function readEditor(form,requireDetection){
+  const fields=form.elements,mode=fields.mode.value;
+  const rules=Object.fromEntries(ruleInputs.map(key=>[key,Number(fields[key].value)]));
+  for(const key of ['allowIds','denyIds']){
+    const value=fields[key].value.trim();
+    rules[key]=value?value.split(/[\s,，]+/).map(Number):[];
+  }
+  const weights=Object.fromEntries(weightInputs.map(key=>[key,Number(fields[key].value)]));
+  return validateStrategy({mode,rules,requireDetection,weights});
 }
-function readEditor(prefix){
-  const mode=$(prefix+'Mode').value;
-  const rules=Object.fromEntries(Object.entries(ruleInputs).map(([id,key])=>[key,Number($(prefix+id).value)]));
-  const ids=id=>$(prefix+id).value.trim()?$(prefix+id).value.trim().split(/[\s,，]+/).map(Number):[];
-  rules.allowIds=ids('AllowIds');rules.denyIds=ids('DenyIds');
-  return validateStrategy({mode,rules,requireDetection:editorDetection[prefix],weights:mode==='weighted'?{price:Number($(prefix+'Price').value),latency:Number($(prefix+'Latency').value),success:Number($(prefix+'Success').value)}:DEFAULT_STRATEGY.weights});
+function keyStrategyEditor(config){
+  const form=node('form',null,'key-strategy-editor');
+  form.setAttribute('aria-label',`Key ${config.keyId} 的策略`);
+  attachStrategyFields(form,config.strategy);
+  form.prepend(node('h4','调整策略'));
+  const actions=node('div',null,'actions'),save=node('button','保存策略'),cancel=node('button','取消','quiet');
+  cancel.type='button';
+  cancel.onclick=()=>{strategyEditors.delete(config.keyId);form.remove();};
+  actions.append(save,cancel);form.append(actions);
+  form.onsubmit=event=>{
+    event.preventDefault();
+    act(async()=>{
+      await send({type:'keyStrategy',keyId:config.keyId,strategy:readEditor(form,config.strategy.requireDetection)});
+      strategyEditors.delete(config.keyId);
+    });
+  };
+  return form;
 }
 const format=(value,fn)=>value==null?'未知':fn(value);
+const warningLabels={
+  tool_errors:'工具调用错误',overloaded:'过载',interrupted:'连接中断',connection_failure:'连接失败',
+  slow_response:'响应/连接缓慢',cyber:'策略拒绝',high_error:'高错误率',low_cache:'低缓存率',low_tps:'低 TPS'
+};
+const badgeNumber=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:2});
+const channelPriceNumber=new Intl.NumberFormat('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:8,useGrouping:false});
+const channelPriceFields=[['input_per_million','输入'],['output_per_million','输出'],['cache_input_per_million','缓存输入'],['cache_write_per_million','缓存写入']];
+function candidateBadgeCells(config,choice,now){
+  const details=providerBadgeDetails(choice.hall,now),rank=details?.popularity;
+  const popularity=node('td',rank?`${rank.rank} / ${rank.groups} · ${rank.window}`:'未知');
+  popularity.dataset.label='消费名次';
+  if(rank){
+    popularity.title=`${config.platform} 同类分组的消费排名`;
+    if(rank.history_partial===true)popularity.append(node('div','历史不完整','muted'));
+  }
+
+  const warnings=node('td');
+  warnings.dataset.label='平台告警';
+  for(const {id,trigger} of details?.warnings??[]){
+    const label=Object.hasOwn(warningLabels,id)?warningLabels[id]:id;
+    const unit=id==='low_tps'?' t/s':'%';
+    const operator=({'<=':'≤','>=':'≥'})[trigger.operator]??trigger.operator;
+    const value=`${badgeNumber.format(trigger.value)}${unit} ${operator} ${badgeNumber.format(trigger.threshold)}${unit}`;
+    const line=node('div',`${label} ${value} · ${trigger.window}`);
+    if(id==='high_error')line.title='包含待完成的文本尝试';
+    warnings.append(line);
+  }
+  if(details?.partial)warnings.append(node('div','历史不完整','muted'));
+  if(!warnings.childNodes.length)warnings.textContent=!details || details.unknown?'未知':'—';
+  return [popularity,warnings];
+}
+function channelPriceLines(price){
+  const lines=[];
+  for(const [field,label] of channelPriceFields){
+    const value=price?.[field];
+    if(Number.isFinite(value) && value>=0)lines.push(`${label} $${channelPriceNumber.format(value)}`);
+  }
+  const fallback=price?.fallback;
+  if(lines.length && typeof fallback?.model==='string' && Array.isArray(fallback.fields) && fallback.fields.length){
+    lines.push(`含 ${fallback.model} 兜底价`);
+  }
+  return lines;
+}
+function priceUnavailableTable(config,choices){
+  const wrap=node('div',null,'table-wrap'),table=node('table'),head=node('thead'),header=node('tr'),body=node('tbody');
+  const columns=['渠道','价格状态','渠道价（1×）','消费名次','平台告警'];
+  header.append(...columns.map(label=>node('th',label)));
+  head.append(header);
+  const now=Date.now();
+  for(const choice of choices){
+    const row=node('tr');
+    const channel=node('td',`${choice.code} [${choice.id}]`),status=node('td',choice.reason),price=node('td');
+    channel.dataset.label=columns[0];
+    status.dataset.label=columns[1];
+    price.dataset.label=columns[2];
+    const lines=channelPriceLines(choice.channelPrice);
+    if(lines.length)price.append(...lines.map(line=>node('div',line)));
+    else price.textContent='未知';
+    row.append(channel,status,price,...candidateBadgeCells(config,choice,now));
+    body.append(row);
+  }
+  table.append(head,body);
+  wrap.append(table);
+  return wrap;
+}
 function confirmSwitch(config,state,target){
   const dialog=node('dialog');dialog.append(node('h2','确认手动切换'),node('p',`Key ${config.keyId} · ${config.model}`),node('p',`当前分组 ${state.expectedGroupId} → ${target.code} [${target.id}]`),node('p','确认后会真实修改首选分组，并暂停此 key 的自动选择。平台故障转移设置保持原样。'));
   const actions=node('div',null,'actions'),cancel=node('button','取消','quiet'),confirm=node('button','确认切换');
@@ -531,18 +784,41 @@ function confirmSwitch(config,state,target){
 }
 function candidateTable(config,state){
   const wrap=node('div',null,'table-wrap'),table=node('table'),head=node('thead'),header=node('tr');
-  const columns=[['code','渠道',v=>v],['rawMultiplier','原始倍率',v=>v+'×'],['accountMultiplier','账号倍率',v=>v+'×'],['stars','用户评分',v=>'★ '+v.toFixed(2)],['cost','真实价格',v=>'￥'+v.toFixed(6)+'/M'],['latency','首响应延迟',v=>Math.round(v)+' ms'],['success','成功率',v=>(v*100).toFixed(2)+'%'],['detection','模型检测',v=>v]];
+  const columns=[['code','渠道',v=>v],['rawMultiplier','原始倍率',v=>v+'×'],['accountMultiplier','账号倍率',v=>v+'×'],['stars','用户评分',v=>'★ '+v.toFixed(2)],['cost','真实价格',v=>'￥'+v.toFixed(6)+'/M'],['latency','首响应延迟',v=>Math.round(v)+' ms'],['success','成功率',v=>(v*100).toFixed(2)+'%'],['cacheHit','缓存率',v=>(v*100).toFixed(2)+'%'],['detection','模型检测',v=>v]];
   const sort=viewSort.get(config.keyId)||{key:'score',direction:-1};
   const sortLabel=node('label','排序显示','compact-sort');const sortSelect=node('select');
-  option(sortSelect,'score:-1','策略最优');
+  option(sortSelect,'score:-1',['accountMultiplier','rate'].includes(state.rankingBasis)?'策略排序 · 账号倍率低优先':state.rankingBasis==='cacheHit'?'策略排序 · 缓存率高优先':'策略排序');
   for(const [key,label] of columns){option(sortSelect,key+':1',label+' ↑');option(sortSelect,key+':-1',label+' ↓');}
   sortSelect.value=sort.key+':'+sort.direction;
   sortSelect.onchange=()=>{const [key,direction]=sortSelect.value.split(':');viewSort.set(config.keyId,{key,direction:Number(direction)});refresh().catch(e=>$('message').textContent=e.message);};
   sortLabel.append(sortSelect);wrap.append(sortLabel);
+  if(state.rankingBasis==='accountMultiplier')wrap.append(node('p','全部合格渠道的真实价格缺失，本轮按账号倍率从低到高选择；同倍率保留当前渠道。','muted'));
+  if(state.rankingBasis==='rate')wrap.append(node('p','按账号倍率从低到高选择；同倍率保留当前渠道。','muted'));
+  if(state.rankingBasis==='cacheHit')wrap.append(node('p','按指定模型的 1h 缓存命中率从高到低选择；同缓存率保留当前渠道，缓存数据缺失或过期的渠道会被排除。','muted'));
   for(const [key,label] of columns){const th=node('th'),button=node('button',label+(sort.key===key?(sort.direction===1?' ↑':' ↓'):''),'column-sort');button.onclick=()=>{viewSort.set(config.keyId,{key,direction:sort.key===key?-sort.direction:['score','success','stars'].includes(key)?-1:1});refresh().catch(e=>$('message').textContent=e.message);};th.append(button);header.append(th);}
-  header.append(node('th','操作'));head.append(header);table.append(head);const body=node('tbody');
+  header.append(node('th','消费名次'),node('th','平台告警'),node('th','操作'));head.append(header);table.append(head);const body=node('tbody');
   const choices=[...state.choices].sort((a,b)=>{const x=a[sort.key],y=b[sort.key];if(x==null)return y==null?0:1;if(y==null)return -1;return (typeof x==='number'?x-y:String(x).localeCompare(String(y)))*sort.direction;});
-  for(const choice of choices){const row=node('tr');row.classList.toggle('current',choice.id===state.expectedGroupId);for(const [key,,formatter] of columns){const value=key==='code'?`${choice.code} [${choice.id}]`:format(choice[key],formatter);const td=node('td',value);if(key==='cost'&&choice.estimated)td.append(node('small',`估算 · ${choice.priceSamples} 条样本`,'price-estimate'));td.dataset.label=columns.find(col=>col[0]===key)[1];row.append(td);}
+  const now=Date.now();
+  for(const choice of choices){
+    const row=node('tr');
+    row.classList.toggle('current',choice.id===state.expectedGroupId);
+    for(const [key,label,formatter] of columns){
+      const value=key==='code'?`${choice.code} [${choice.id}]`:format(choice[key],formatter);
+      const td=node('td',value);
+      if(key==='cost' && choice.estimated){
+        const label=node('small',`${choice.estimateKind==='cache-rate'?'缓存率 × 账号倍率估算':'样本估算'} · ${choice.priceSamples} 条样本`,'price-estimate');
+        if(choice.estimateBasis){const b=choice.estimateBasis;label.title=`按平台计价单位估算每百万输入 Token：${b.accountMultiplier} × [${b.inputPrice} × (1 − ${(b.cacheHit*100).toFixed(2)}%) + ${b.cacheInputPrice} × ${(b.cacheHit*100).toFixed(2)}%]；输出与单独计费的缓存写入另计。`;}
+        td.append(label);
+      }
+      if(key==='cost' && choice.cost==null && choice.priceReason){
+        td.append(node('div',choice.priceReason,'muted'));
+        const lines=channelPriceLines(choice.channelPrice);
+        if(lines.length)td.append(node('div','渠道价 · 1× / 百万 Token','muted'),...lines.map(line=>node('div',line,'muted')));
+      }
+      td.dataset.label=label;
+      row.append(td);
+    }
+    row.append(...candidateBadgeCells(config,choice,now));
     const cell=node('td');cell.dataset.label='操作';if(choice.id===state.expectedGroupId)cell.append(node('span','当前','badge'));else{const button=node('button','切换','quiet');button.setAttribute('aria-label',`切换到 ${choice.code}`);button.disabled=!!state.pending;button.onclick=()=>confirmSwitch(config,state,choice);cell.append(button);}row.append(cell);body.append(row);
   }
   table.append(body);wrap.append(table);return wrap;
@@ -558,7 +834,13 @@ function fillCatalog(){
 }
 async function refresh(){
   const data=await send({type:'state'});app=data.app;
-  if(!globalLoaded){setEditor('global',app.defaultStrategy);$('checkMinutes').value=app.checkMinutes||5;globalLoaded=true;}
+  if(!globalLoaded){
+    attachStrategyFields(defaultEditor,app.defaultStrategy);
+    defaultEditor.elements.requireDetection.checked=app.defaultStrategy.requireDetection!==false;
+    $('checkMinutes').value=app.checkMinutes||5;
+    globalLoaded=true;
+  }
+  for(const keyId of strategyEditors.keys())if(!app.configs.some(c=>c.keyId===keyId))strategyEditors.delete(keyId);
   if(app.catalog && app.catalog.at!==appliedCatalogAt){catalog=app.catalog;fillCatalog();appliedCatalogAt=catalog.at;}
   $('connection').textContent=data.connected?'平台已连接':'等待连接';
   $('connection').classList.toggle('connected',data.connected);
@@ -571,28 +853,51 @@ async function refresh(){
     const s=app.states[c.keyId]||{},box=node('article',null,'monitor');
     const groupText=s.observedGroupId!=null?`原记录分组 ${s.expectedGroupId??'未知'} · 最近读取分组 ${s.observedGroupId}`:`最近确认分组 ${s.expectedGroupId??'未知'}`;
     const top=node('div',null,'monitor-top'),name=node('div',null,'monitor-name');name.append(node('h3',`${c.model} · Key ${c.keyId}`));top.append(name,node('span',c.paused?'已暂停':c.automatic?'自动运行':'仅预览',`badge ${c.paused?'paused':c.automatic?'auto':'preview'}`));
-    box.append(top,node('p',`${c.paused?'已暂停':c.automatic?'自动切换':'仅预览'} · ${s.status||'等待检查'}`,'monitor-status'),node('p',`${groupText} · ${c.strategy?'独立策略':'继承全局'} · ${strategyLabel(c.strategy||app.defaultStrategy)}`,'monitor-meta'));
+    box.append(top,node('p',`${c.paused?'已暂停':c.automatic?'自动切换':'仅预览'} · ${s.status||'等待检查'}`,'monitor-status'),node('p',`${groupText} · ${strategyLabel(c.strategy)}`,'monitor-meta'));
     const current=s.choices?.find(x=>x.id===s.expectedGroupId);
-    if(current){const summary=node('div',null,'current-summary'),price=node('span',format(current.cost,v=>'￥'+v.toFixed(6)),'price');price.append(node('small',' /M'));summary.append(node('span','当前渠道','eyebrow'),node('span',current.code,'channel'),price);if(current.estimated)summary.append(node('span','估算','badge preview'));box.append(summary);}
+    if(current){const summary=node('div',null,'current-summary'),price=node('span',current.cost==null?'真实价格未知':'￥'+current.cost.toFixed(6),'price');if(current.cost!=null)price.append(node('small',' /M'));summary.append(node('span','当前渠道','eyebrow'),node('span',current.code,'channel'),price);if(current.estimated)summary.append(node('span',current.estimateKind==='cache-rate'?'缓存率 × 账号倍率估算':'样本估算','badge preview'));box.append(summary);}
     if(Array.isArray(s.choices)){const details=node('details',null,'candidate-details');details.open=expandedCandidates.has(c.keyId);details.addEventListener('toggle',()=>{if(details.open)expandedCandidates.add(c.keyId);else expandedCandidates.delete(c.keyId);});details.append(node('summary',`合格候选 · ${s.choices.length} 个`));if(s.choices.length)details.append(candidateTable(c,s),node('p','显示排序不影响自动策略。手动切换会重新验证资格，并暂停此 key 的自动选择。','muted'));else details.append(node('p','当前没有符合筛选条件的渠道。展开下方“未参与比较”查看原因；下轮检查会重新评估。','muted'));box.append(details);}
-    if(s.excluded&&Object.keys(s.excluded).length){const details=node('details',null,'exclusions'),list=node('div',null,'exclusion-list');details.open=expandedExclusions.has(c.keyId);details.ontoggle=()=>{if(details.open)expandedExclusions.add(c.keyId);else expandedExclusions.delete(c.keyId);};for(const [reason,count] of Object.entries(s.excluded)){const chip=node('span',null,'reason-chip');chip.append(node('span',reason),node('b',`${count} 个`));list.append(chip);}details.append(node('summary',`未参与比较 · ${Object.values(s.excluded).reduce((a,b)=>a+b,0)} 个渠道`),list);box.append(details);}
+    if(s.excluded&&Object.keys(s.excluded).length){
+      const details=node('details',null,'exclusions'),list=node('div',null,'exclusion-list');
+      details.open=expandedExclusions.has(c.keyId);
+      details.ontoggle=()=>{if(details.open)expandedExclusions.add(c.keyId);else expandedExclusions.delete(c.keyId);};
+      for(const [reason,count] of Object.entries(s.excluded)){
+        const chip=node('span',null,'reason-chip');
+        chip.append(node('span',reason),node('b',`${count} 个`));
+        list.append(chip);
+      }
+      details.append(node('summary',`未参与比较 · ${Object.values(s.excluded).reduce((a,b)=>a+b,0)} 个渠道`),list);
+      if(s.priceUnavailableChoices?.length){
+        details.append(node('p','真实价格暂不可用的渠道 · 渠道价按 1×、每百万 Token 展示。','muted'),priceUnavailableTable(c,s.priceUnavailableChoices));
+      }
+      box.append(details);
+    }
     const controls=node('div',null,'monitor-controls');
-    for(const [field,label,checked] of [['override','使用独立策略',!!c.strategy],['automatic','自动改组',c.automatic],['requireDetection','排除检测未通过', (c.strategy||app.defaultStrategy).requireDetection!==false]]){
-      const wrapper=node('label',null,'checkbox'),input=node('input');input.type='checkbox';input.checked=checked;
+    for(const [field,label,checked] of [['automatic','自动改组',c.automatic],['requireDetection','排除检测未通过',c.strategy.requireDetection!==false],['excludeWarnings','排除平台告警',c.excludeWarnings===true]]){
+      const wrapper=node('label',null,'checkbox'),input=node('input');input.type='checkbox';input.checked=checked;input.disabled=!!s.pending;
       input.onchange=()=>act(()=>send({type:'toggleKey',keyId:c.keyId,field,enabled:input.checked}));
       wrapper.append(input,document.createTextNode(label));controls.append(wrapper);
     }
     box.append(controls);
-    if(!c.strategy)box.append(node('p','更改此 key 的检测筛选后，将为它启用独立策略。','muted'));
     const actions=node('div',null,'actions');
-    const edit=node('button','编辑','quiet');edit.addEventListener('click',()=>act(async()=>{
+    const adjust=node('button','调整策略','quiet');
+    adjust.onclick=()=>{
+      let editor=strategyEditors.get(c.keyId);
+      if(!editor){editor=keyStrategyEditor(c);strategyEditors.set(c.keyId,editor);box.append(editor);}
+      editor.elements.mode.focus();
+    };
+    actions.append(adjust);
+    const edit=node('button','编辑绑定','quiet');edit.addEventListener('click',()=>act(async()=>{
       if(!catalog.keys.length){catalog=await send({type:'catalog'});fillCatalog();}
       $('keyId').value=String(c.keyId);$('model').value=JSON.stringify({platform:c.platform,model:c.model});$('automatic').checked=c.automatic;
-      $('keyOverride').checked=!!c.strategy;setEditor('key',c.strategy||app.defaultStrategy);
-      showView('settings');$('configForm').scrollIntoView({behavior:'smooth',block:'center'});$('message').textContent='配置已载入。检查后点击“保存 key 配置”即可恢复监控。';
+      showView('settings');$('configForm').scrollIntoView({behavior:'smooth',block:'center'});$('message').textContent='已载入 Key 与绑定模型。';
     }));actions.append(edit);
-    if(!c.paused){const pause=node('button','暂停','quiet');pause.onclick=()=>act(()=>send({type:'pause',keyId:c.keyId}));actions.append(pause);}
-    const remove=node('button','移除监控','quiet danger');remove.onclick=()=>act(()=>send({type:'remove',keyId:c.keyId}));actions.append(remove);box.append(actions);$('monitors').append(box);
+    const pauseResume=node('button',c.paused?'恢复':'暂停','quiet');
+    pauseResume.onclick=()=>act(()=>send({type:c.paused?'resume':'pause',keyId:c.keyId}));
+    actions.append(pauseResume);
+    const remove=node('button','移除监控','quiet danger');remove.onclick=()=>act(()=>send({type:'remove',keyId:c.keyId}));actions.append(remove);box.append(actions);
+    const editor=strategyEditors.get(c.keyId);if(editor)box.append(editor);
+    $('monitors').append(box);
   }
   $('logs').replaceChildren(...app.logs.map(l=>node('li',`${new Date(l.at).toLocaleString()} · ${l.text}`)));
   if(!app.logs.length)$('logs').append(node('li','暂无记录。连接平台并添加监控后，检查与切换动态会显示在这里。'));
@@ -606,12 +911,9 @@ $('catalog').onclick=()=>act(async()=>{catalog=await send({type:'catalog'});fill
 $('disconnect').onclick=()=>act(()=>send({type:'disconnect'}));
 $('resetAccount').onclick=()=>act(()=>send({type:'resetAccount'}));
 $('check').onclick=()=>act(()=>send({type:'check'}));
-$('saveStrategy').onclick=()=>act(()=>send({type:'strategy',strategy:readEditor('global'),checkMinutes:Number($('checkMinutes').value)}));
-for(const prefix of ['global','key'])$(prefix+'Mode').onchange=()=>toggleEditor(prefix);
-$('keyOverride').onchange=()=>toggleEditor('key');
-$('keyId').onchange=()=>{const c=app?.configs.find(c=>c.keyId===Number($('keyId').value));$('automatic').checked=c?.automatic===true;$('keyOverride').checked=!!c?.strategy;setEditor('key',c?.strategy||app?.defaultStrategy||DEFAULT_STRATEGY);if(c)$('model').value=JSON.stringify({platform:c.platform,model:c.model});};
-setEditor('key',DEFAULT_STRATEGY);
-$('configForm').onsubmit=event=>{event.preventDefault();act(async()=>{const m=JSON.parse($('model').value);await send({type:'configure',keyId:Number($('keyId').value),...m,strategy:$('keyOverride').checked?readEditor('key'):null,automatic:$('automatic').checked});showView('monitors');});};
+defaultEditor.onsubmit=event=>{event.preventDefault();act(()=>send({type:'strategy',strategy:readEditor(defaultEditor,defaultEditor.elements.requireDetection.checked),checkMinutes:Number($('checkMinutes').value)}));};
+$('keyId').onchange=()=>{const c=app?.configs.find(c=>c.keyId===Number($('keyId').value));$('automatic').checked=c?.automatic===true;if(c)$('model').value=JSON.stringify({platform:c.platform,model:c.model});};
+$('configForm').onsubmit=event=>{event.preventDefault();act(async()=>{const m=JSON.parse($('model').value);await send({type:'configure',keyId:Number($('keyId').value),...m,automatic:$('automatic').checked});showView('monitors');});};
 refresh().catch(e=>$('message').textContent=e.message);
 setInterval(()=>{if(!document.querySelector('dialog[open]')&&!document.activeElement?.matches('input,select'))refresh().catch(()=>{});},20000);
 

@@ -21,14 +21,14 @@ background=background.replace("await chrome.storage.session.remove('auth');for",
 let html=(await read('extension/options.html')).match(/<body>([\s\S]*)<script type="module"/)[1];
 html=html.replace('连接只在本次浏览器会话内保留。重启浏览器后需重新访问平台。','脚本使用当前网站登录会话；至少保留一个 AIHub 标签页。')
  .replace('插件不保存完整 API key；只使用网站登录会话访问 aihub.top。平台页面连接后可以关闭。','不保存完整 API key 或登录令牌。页面关闭后停止；后台标签页、休眠及节能可能延后检查。多个标签页共用锁，不重复改组。请勿同时启用扩展版自动改组。')
- .replace('AIHubRouter 0.3.12','AIHubRouter 油猴版 0.1.2');
+ .replace('AIHubRouter 0.3.21','AIHubRouter 油猴版 0.1.11');
 const css=(await read('extension/options.css')).replaceAll(':root',':host').replace(/\bbody\{/g,'.panel{');
 const options=(await read('extension/options.js')).replace(/^import .*\r?\n/,'');
 const runtime=await read('userscript/runtime.js');
 const output=`// ==UserScript==
 // @name         AIHubRouter 渠道优选
 // @namespace    https://github.com/tibbar213/AIHubRouter
-// @version      0.1.2
+// @version      0.1.11
 // @description  一个 key 绑定一个模型；默认仅预览，按明确授权自动优选渠道。
 // @match        https://aihub.top/*
 // @noframes
