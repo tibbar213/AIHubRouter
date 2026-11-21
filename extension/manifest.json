@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AIHubRouter · 模型渠道优选",
-  "version": "0.3.21",
+  "version": "0.4.0",
   "description": "为每个指定模型的 key 独立监控价格与健康状态，按价格、延迟或成功率选择合格首选分组。",
   "minimum_chrome_version": "120",
   "permissions": [
