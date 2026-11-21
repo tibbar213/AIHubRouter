@@ -81,14 +81,14 @@ async function authorizedSnapshot(){
   const groups=new Map(available.map(g=>[g.id,g]));
   snapshot.items=snapshot.items.map(g=>{
     const a=groups.get(g.group_id);
-    return {...g,public_rate_multiplier:g.rate_multiplier,bindable:!!a,rate_multiplier:rates?.[g.group_id]??a?.rate_multiplier??g.rate_multiplier,peak_rate_enabled:a?.peak_rate_enabled,subscription_type:a?.subscription_type??g.subscription_type};
+    return {...g,public_rate_multiplier:g.rate_multiplier,bindable:!!a,rate_multiplier:rates?.[g.group_id]??a?.rate_multiplier??g.rate_multiplier,subscription_type:a?.subscription_type??g.subscription_type};
   });
   return snapshot;
 }
-function catalogData(all,snapshot){
+function catalogData(all,snapshot,usage){
   const models=[...new Set(snapshot.items.flatMap(g=>(g.group_models||[]).map(m=>m.model).filter(model=>typeof model==='string' && model.length>0 && model.length<=200)))].sort((a,b)=>a.localeCompare(b)).map(model=>{
     // Lowest account-rate price among groups this account can bind; null when none is comparable.
-    const costs=snapshot.items.filter(g=>g.bindable!==false).map(g=>platformPrice(g,model)?.cost).filter(Number.isFinite);
+    const costs=snapshot.items.filter(g=>g.bindable!==false).map(g=>platformPrice(g,model,usage)?.cost).filter(Number.isFinite);
     return {model,minPrice:costs.length?Math.min(...costs):null};
   });
   return {keys:all,models,at:Date.now()};
@@ -114,7 +114,7 @@ async function check(){
     }
     await save(app);
     const snapshot=await authorizedSnapshot();
-    app.catalog=catalogData(all,snapshot);
+    app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);
     if(snapshot.stale!==false || !(Date.now()-Date.parse(snapshot.generated_at)<=INTERVAL) || Date.parse(snapshot.generated_at)>Date.now()+60000)throw new Error('STALE');
     for(const c of app.configs){
       if(c.paused || waiting.has(c.keyId))continue;
@@ -196,7 +196,7 @@ async function handle(message,pauseRequest,disconnectRequest){
     if(!confirmed.state.choices?.some(x=>x.id===message.target))throw new Error('切换前条件已变化，请重新检查');
     if(disconnectRequested)throw new Error('已断开连接，手动切换已取消');
     c.paused=true;
-    const state={...confirmed.state,candidate:null,count:0,pending:{from:current.groupId,to:message.target,manual:true,at:Date.now()},status:'手动切换结果待核实'};
+    const state={...confirmed.state,candidate:null,count:0,pending:{from:current.groupId,to:message.target,at:Date.now()},status:'手动切换结果待核实'};
     app.states[c.keyId]=state;await save(app);
     try{
       await api(`/api/v1/keys/${c.keyId}/group`,{method:'PUT',body:{group_id:message.target}});
@@ -209,7 +209,7 @@ async function handle(message,pauseRequest,disconnectRequest){
   }
   if(message.type==='catalog'){
     await connectedIdentity(app);
-    const [all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);app.catalog=catalogData(all,snapshot);await save(app);
+    const [all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);await save(app);
     return app.catalog;
   }
   if(message.type==='configure'){
@@ -304,5 +304,4 @@ async function ensureAlarm(){const app=await load(),minutes=app.checkMinutes||5,
 chrome.runtime.onInstalled.addListener(()=>{ensureAlarm();chrome.storage.local.setAccessLevel({accessLevel:'TRUSTED_CONTEXTS'});});
 chrome.runtime.onStartup.addListener(()=>{ensureAlarm();serial(check);});
 chrome.alarms.onAlarm.addListener(alarm=>{if(alarm.name===ALARM)serial(check);});
-chrome.action.onClicked.addListener(()=>chrome.runtime.openOptionsPage());
 ensureAlarm();

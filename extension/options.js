@@ -30,12 +30,13 @@ function attachStrategyFields(form,strategy){
   for(const key of ruleInputs)fields[key].value=s.rules[key];
   for(const key of ['allowIds','denyIds'])fields[key].value=s.rules[key].join(', ');
   for(const key of weightInputs)fields[key].value=s.weights[key];
+  fields.inputRatio.value=s.usage.inputRatio;fields.cacheRate.value=s.usage.cacheRate;fields.measuredCache.checked=s.usage.measuredCache;
   const toggleWeights=()=>{
     const weighted=fields.mode.value==='weighted';
     form.querySelector('[data-weights]').hidden=!weighted;
     for(const key of weightInputs)fields[key].disabled=!weighted;
   };
-  fields.mode.onchange=toggleWeights;
+  form.addEventListener('change',event=>{if(event.target.name==='mode')toggleWeights();});
   toggleWeights();
 }
 function readEditor(form,requireDetection){
@@ -46,7 +47,8 @@ function readEditor(form,requireDetection){
     rules[key]=value?value.split(/[\s,，]+/).map(Number):[];
   }
   const weights=Object.fromEntries(weightInputs.map(key=>[key,Number(fields[key].value)]));
-  return validateStrategy({mode,rules,requireDetection,weights});
+  const usage={inputRatio:Number(fields.inputRatio.value),cacheRate:Number(fields.cacheRate.value),measuredCache:fields.measuredCache.checked};
+  return validateStrategy({mode,rules,requireDetection,weights,usage});
 }
 function keyStrategyEditor(config){
   const form=node('form',null,'key-strategy-editor');
@@ -55,7 +57,7 @@ function keyStrategyEditor(config){
   form.prepend(node('h4','调整策略'));
   const actions=node('div',null,'actions'),save=node('button','保存策略'),cancel=node('button','取消','quiet');
   cancel.type='button';
-  cancel.onclick=()=>{strategyEditors.delete(config.keyId);form.remove();};
+  cancel.onclick=()=>{strategyEditors.delete(config.keyId);form.remove();refresh().catch(()=>{});};
   actions.append(save,cancel);form.append(actions);
   form.onsubmit=event=>{
     event.preventDefault();
@@ -65,6 +67,10 @@ function keyStrategyEditor(config){
     });
   };
   return form;
+}
+function priceProfileText(strategy){
+  const u=validateStrategy(strategy).usage;
+  return `模型价格按输入:输出 ${u.inputRatio}:1 计算，缓存命中率${u.measuredCache?`优先用渠道实测值，无实测时按 ${u.cacheRate}%`:`固定按 ${u.cacheRate}%`}。`;
 }
 const format=(value,fn)=>value==null?'未知':fn(value);
 const warningLabels={
@@ -229,7 +235,7 @@ async function refresh(){
     box.append(keyHeader(c.keyId,keyById.get(c.keyId),c,s),node('p',`${c.paused?'已暂停':c.automatic?'自动切换':'仅预览'} · ${s.status||'等待检查'}`,'monitor-status'),node('p',`${groupText} · ${strategyLabel(c.strategy)}`,'monitor-meta'));
     const current=s.choices?.find(x=>x.id===s.expectedGroupId);
     if(current){const summary=node('div',null,'current-summary'),price=node('span',current.cost==null?'模型价格未知':'$'+current.cost.toFixed(6),'price');if(current.cost!=null)price.append(node('small',' /M'));summary.append(node('span','当前渠道','eyebrow'),node('span',current.code,'channel'),price);box.append(summary);}
-    if(Array.isArray(s.choices)){const details=node('details',null,'candidate-details');details.open=expandedCandidates.has(c.keyId);details.addEventListener('toggle',()=>{if(details.open)expandedCandidates.add(c.keyId);else expandedCandidates.delete(c.keyId);});details.append(node('summary',`合格候选 · ${s.choices.length} 个`));if(s.choices.length)details.append(candidateTable(c,s),node('p','显示排序不影响自动策略。手动切换会重新验证资格，并暂停此 key 的自动选择。','muted'));else details.append(node('p','当前没有符合筛选条件的渠道。展开下方“未参与比较”查看原因；下轮检查会重新评估。','muted'));box.append(details);}
+    if(Array.isArray(s.choices)){const details=node('details',null,'candidate-details');details.open=expandedCandidates.has(c.keyId);details.addEventListener('toggle',()=>{if(details.open)expandedCandidates.add(c.keyId);else expandedCandidates.delete(c.keyId);});details.append(node('summary',`合格候选 · ${s.choices.length} 个`));if(s.choices.length)details.append(candidateTable(c,s),node('p',priceProfileText(c.strategy)+' 显示排序不影响自动策略。手动切换会重新验证资格，并暂停此 key 的自动选择。','muted'));else details.append(node('p','当前没有符合筛选条件的渠道。展开下方“未参与比较”查看原因；下轮检查会重新评估。','muted'));box.append(details);}
     if(s.excluded&&Object.keys(s.excluded).length){
       const details=node('details',null,'exclusions'),list=node('div',null,'exclusion-list');
       details.open=expandedExclusions.has(c.keyId);
@@ -255,11 +261,14 @@ async function refresh(){
     }
     const footer=node('div',null,'monitor-footer');
     const actions=node('div',null,'actions');
-    const adjust=node('button','调整策略','quiet');
+    const adjust=node('button',strategyEditors.has(c.keyId)?'收起策略':'调整策略','quiet');
+    adjust.setAttribute('aria-expanded',String(strategyEditors.has(c.keyId)));
     adjust.onclick=()=>{
       let editor=strategyEditors.get(c.keyId);
-      if(!editor){editor=keyStrategyEditor(c);strategyEditors.set(c.keyId,editor);box.append(editor);}
-      editor.elements.mode.focus();
+      if(editor){strategyEditors.delete(c.keyId);editor.remove();adjust.textContent='调整策略';adjust.setAttribute('aria-expanded','false');return;}
+      editor=keyStrategyEditor(c);strategyEditors.set(c.keyId,editor);box.append(editor);
+      adjust.textContent='收起策略';adjust.setAttribute('aria-expanded','true');
+      editor.querySelector('[name=mode]:checked')?.focus();
     };
     actions.append(adjust);
     const pauseResume=node('button',c.paused?'恢复':'暂停','quiet');
