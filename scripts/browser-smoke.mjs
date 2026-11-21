@@ -1,11 +1,9 @@
 import {chromium} from 'playwright-core';
-import {resolve} from 'node:path';
-import {mkdir,mkdtemp} from 'node:fs/promises';
+import {dirname,join,resolve} from 'node:path';
+import {tmpdir} from 'node:os';
+import {mkdtemp,rm} from 'node:fs/promises';
 import assert from 'node:assert/strict';
-await mkdir('work',{recursive:true});
-const profile=await mkdtemp(resolve('work/browser-smoke-'));
-await mkdir('outputs',{recursive:true});
-await mkdir('release-prep',{recursive:true});
+const profile=await mkdtemp(join(tmpdir(),'aihubrouter-extension-smoke-'));
 const extension=resolve('extension');
 console.log('Starting isolated Edge extension smoke test');
 const context=await chromium.launchPersistentContext(profile,{
@@ -48,7 +46,7 @@ try{
   await page.getByRole('button',{name:'保存默认策略与检查间隔',exact:true}).click();
   await page.getByText('已完成',{exact:true}).waitFor();
   assert.equal((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).defaultStrategy.weights.price,60);
-  await page.screenshot({path:'outputs/settings-preview.png',fullPage:true});
+  await page.screenshot({path:join(profile,'settings-preview.png'),fullPage:true});
   await page.getByRole('button',{name:'监控0',exact:true}).click();
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByText('已完成',{exact:true}).waitFor();
@@ -66,13 +64,9 @@ try{
       else if(path==='/api/v1/keys')data={pages:1,items:[{id:101,name:'测试用 key',status:'active',group_id:current,max_rate_multiplier:globalThis.testRateLimit,key:'MUST_NOT_LEAVE_TEST'}]};
       else if(path==='/api/v1/groups/available')data=[12,24].map(id=>({id,rate_multiplier:1,peak_rate_enabled:false,subscription_type:'standard'}));
       else if(path==='/api/v1/groups/rates')data={24:.1};
-      else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date().toISOString(),items:[12,24].map(id=>({group_id:id,code:'示例-'+id,platform:'openai',rate_multiplier:1,available:id===24||globalThis.testAllHealthy,probe_state:'enabled',probe_expires_at:expires,long_context_pricing_enabled:false,subscription_type:'standard',model_detection:{model:'gpt-example',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'gpt-example',price}],summary_models:{'gpt-example':{effective_input_price_per_million:id===12?1:.1,effective_multiplier:.05,effective_multiplier_ready:true,range_cache:{ready:true,coverage_complete:true,stale:false,usage_records:100,refreshed_at:new Date().toISOString(),cache_hit_rate:.9},sample_count:100,user_latency_ms:id===12?1000:2000,success_rate:id===12?.95:.99}},model_cards:[{model:'gpt-example',health:'healthy',probe_state:'enabled',health_expires_at:expires}]}))};
+      else if(path==='/api/v2/public/providers')data={stale:false,generated_at:new Date().toISOString(),items:[12,24].map(id=>({group_id:id,code:'示例-'+id,platform:'openai',rate_multiplier:1,available:id===24||globalThis.testAllHealthy,probe_state:'enabled',probe_expires_at:expires,long_context_pricing_enabled:false,subscription_type:'standard',model_detection:{model:'gpt-example',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'gpt-example',price}],summary_models:{'gpt-example':{range_cache:{ready:true,coverage_complete:true,stale:false,usage_records:100,refreshed_at:new Date().toISOString(),cache_hit_rate:.9},sample_count:100,user_latency_ms:id===12?1000:2000,success_rate:id===12?.95:.99}},model_cards:[{model:'gpt-example',health:'healthy',probe_state:'enabled',health_expires_at:expires}]}))};
       else if(path==='/api/v1/keys/101/group'){globalThis.testWrites.push(JSON.parse(options.body));current=JSON.parse(options.body).group_id;data={group_id:current};}
       else throw new Error('Unexpected test request');
-      if(path==='/api/v2/public/providers' && globalThis.testEstimatePrices)for(const group of data.items){
-        const summary=group.summary_models['gpt-example'];summary.effective_input_price_per_million=null;
-        summary.range_cache.pricing_models={'gpt-example':{usage_records:100,input_tokens:100,cache_read_tokens:900,cache_creation_tokens:0,baseline_input_per_million:5,sol_equivalent_unit_price:.95,unknown_context_records:0,long_input_tokens:0,long_cache_read_tokens:0,long_cache_creation_tokens:0}};
-      }
       return {ok:true,status:200,json:async()=>({code:0,data})};
     };
   });
@@ -80,7 +74,9 @@ try{
   await page.getByRole('button',{name:'读取 key 与模型',exact:true}).click();
   await page.locator('#keyId option[value="101"]').waitFor({state:'attached'});
   await page.locator('#keyId').selectOption('101');
-  await page.locator('#model').selectOption({label:'OpenAI / gpt-example'});
+  await page.locator('#model').selectOption({label:'gpt-example'});
+  assert.equal(await page.locator('#model').inputValue(),JSON.stringify({model:'gpt-example'}));
+  assert.equal(await page.locator('#appVersion').textContent(),await worker.evaluate(()=>chrome.runtime.getManifest().version));
   await page.getByRole('button',{name:'保存 key 配置',exact:true}).click();
   try { await page.getByRole('heading',{name:'gpt-example · Key 101',exact:true}).waitFor({timeout:5000}); } catch(e) { console.log('UI status:', await page.locator('#message').innerText()); console.log('Page errors:', errors); throw e; }
   await page.getByRole('button',{name:'调整策略',exact:true}).click();
@@ -102,7 +98,7 @@ try{
   assert.equal(await editor.locator('[name=minCacheHit]').inputValue(),'80');
   await editor.locator('[name=confirmRounds]').fill('2');
   await editor.getByRole('button',{name:'保存策略',exact:true}).click();
-  await page.getByText('最近确认分组 12 · 真实价格优先',{exact:true}).waitFor();
+  await page.getByText('最近确认分组 12 · 模型价格优先',{exact:true}).waitFor();
   assert.equal(await page.locator('[data-panel=settings]').isVisible(),false);
   const saved=await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app);
   assert.equal(saved.configs[0].strategy.rules.confirmRounds,2);
@@ -123,35 +119,27 @@ try{
   assert.equal(await page.locator('.candidate-details thead').isVisible(),false);
   assert.equal(await page.locator('.candidate-details .compact-sort select').isVisible(),true);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-  await page.screenshot({path:'outputs/monitor-sidebar.png',fullPage:true});
+  await page.screenshot({path:join(profile,'monitor-sidebar.png'),fullPage:true});
   await page.setViewportSize({width:340,height:700});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-  await page.screenshot({path:'outputs/monitor-narrow.png',fullPage:true});
+  await page.screenshot({path:join(profile,'monitor-narrow.png'),fullPage:true});
   await page.emulateMedia({colorScheme:'dark'});
-  await page.screenshot({path:'outputs/monitor-dark.png',fullPage:true,animations:'disabled'});
-  assert.equal(await page.locator('#addKey').evaluate(e=>getComputedStyle(e).backgroundColor),'rgb(32, 43, 62)');
+  await page.screenshot({path:join(profile,'monitor-dark.png'),fullPage:true,animations:'disabled'});
+  assert.equal(await page.locator('#addKey').evaluate(e=>getComputedStyle(e).backgroundColor),'rgb(21, 27, 36)');
   await page.emulateMedia({colorScheme:'light'});
   await page.getByRole('button',{name:'配置',exact:true}).click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-  await page.screenshot({path:'outputs/settings-narrow.png',fullPage:true,animations:'disabled'});
+  await page.screenshot({path:join(profile,'settings-narrow.png'),fullPage:true,animations:'disabled'});
   await page.getByRole('button',{name:'监控1',exact:true}).click();
   await page.locator('.candidate-details .compact-sort select').selectOption('cost:1');
   await page.setViewportSize({width:1200,height:1000});
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[]);
   await page.getByLabel('自动改组').check();
-  await page.getByText('最近确认分组 12 · 真实价格优先',{exact:true}).waitFor();
+  await page.getByText('最近确认分组 12 · 模型价格优先',{exact:true}).waitFor();
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByText('自动切换 · 已确认切换成功',{exact:true}).waitFor();
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
   await worker.evaluate(()=>{globalThis.testAllHealthy=true;});
-  await worker.evaluate(()=>{globalThis.testEstimatePrices=true;});
-  await page.getByRole('button',{name:'立即检查',exact:true}).click();
-  await page.locator('.current-summary .badge').getByText('缓存率 × 账号倍率估算',{exact:true}).waitFor();
-  assert.match(await page.locator('.price-estimate').first().textContent(),/缓存率 × 账号倍率估算 · 100 条样本/);
-  assert.match(await page.locator('.price-estimate').first().getAttribute('title'),/按平台计价单位/);
-  assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
-  await page.screenshot({path:'outputs/cache-price-estimate.png',fullPage:true});
-  await worker.evaluate(()=>{globalThis.testEstimatePrices=false;});
   await worker.evaluate(()=>{globalThis.testRateLimit=.5;});
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.locator('.exclusions summary').click();
@@ -161,10 +149,10 @@ try{
   await worker.evaluate(()=>{globalThis.testRateLimit=0;});
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
   await page.getByRole('button',{name:'切换到 示例-12',exact:true}).waitFor();
-  await page.screenshot({path:'outputs/monitor-preview.png',fullPage:true});
+  await page.screenshot({path:join(profile,'monitor-preview.png'),fullPage:true});
   await page.setViewportSize({width:1280,height:800});
   await page.locator('.monitor').first().scrollIntoViewIfNeeded();
-  await page.screenshot({path:'release-prep/store-screenshot.png'});
+  await page.screenshot({path:join(profile,'store-screenshot.png')});
   await page.getByRole('button',{name:'切换到 示例-12',exact:true}).click();
   await page.getByRole('button',{name:'取消',exact:true}).click();
   assert.deepEqual(await worker.evaluate(()=>globalThis.testWrites),[{group_id:24}]);
@@ -176,17 +164,40 @@ try{
     const {app}=await chrome.storage.local.get('app');
     for(const state of Object.values(app.states)){
       state.rankingBasis='accountMultiplier';
-      state.status='全部真实价格缺失，当前账号倍率最低（同倍率不切）';
+      state.status='全部模型价格缺失，当前账号倍率最低（同倍率不切）';
       for(const choice of state.choices||[])choice.cost=null;
     }
     await chrome.storage.local.set({app});
   });
   await page.reload();
   await page.locator('.candidate-details summary').click();
-  await page.getByText('全部合格渠道的真实价格缺失，本轮按账号倍率从低到高选择；同倍率保留当前渠道。',{exact:true}).waitFor();
+  await page.getByText('全部合格渠道的模型价格缺失，本轮按账号倍率从低到高选择；同倍率保留当前渠道。',{exact:true}).waitFor();
   assert.equal(await page.locator('.compact-sort option[value="score:-1"]').textContent(),'策略排序 · 账号倍率低优先');
-  await page.getByRole('button',{name:'移除监控',exact:true}).click();
+  async function confirmDestructive(trigger,label,assertCancelled){
+    const dialog=page.locator('dialog[open]'),cancel=dialog.getByRole('button',{name:'取消',exact:true});
+    await trigger.click();
+    assert.equal(await cancel.evaluate(button=>button.matches(':focus')),true);
+    await cancel.click();
+    await assertCancelled();
+    await trigger.click();
+    await dialog.getByRole('button',{name:label,exact:true}).click();
+  }
+  const storedApp=()=>worker.evaluate(async()=>(await chrome.storage.local.get('app')).app);
+  await confirmDestructive(page.getByRole('button',{name:'移除监控',exact:true}),'确认移除',async()=>assert.equal((await storedApp()).configs.length,1));
   await page.getByText('还没有监控。先连接平台，再绑定 key 和模型。').waitFor();
+  await page.getByRole('button',{name:'配置',exact:true}).click();
+  const storedAuth=()=>worker.evaluate(async()=>(await chrome.storage.session.get('auth')).auth);
+  await confirmDestructive(page.locator('#disconnect'),'确认断开',async()=>assert.ok(await storedAuth()));
+  await page.getByText('已完成',{exact:true}).waitFor();
+  assert.equal(await storedAuth(),undefined);
+  await page.locator('[data-view=activity]').click();
+  await confirmDestructive(page.locator('#resetAccount'),'确认清空',async()=>assert.ok((await storedApp()).account));
+  await page.getByText('已完成',{exact:true}).waitFor();
+  assert.equal((await storedApp()).account,null);
   assert.deepEqual(errors,[]);
   console.log('Edge loaded; advanced filters, global/key strategies, candidate columns/sort, manual cancel/confirm/revalidation/pause and simulated auto-switch verified; no page errors.');
-}finally{await context.close();}
+}finally{
+  await context.close();
+  if(dirname(resolve(profile))!==resolve(tmpdir()))throw new Error('Unexpected smoke-test profile path');
+  await rm(profile,{recursive:true,force:true,maxRetries:3});
+}

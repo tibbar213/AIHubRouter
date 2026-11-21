@@ -2,6 +2,8 @@ import {validateStrategy,strategyLabel,providerBadgeDetails} from './core.js';
 const $=id=>document.getElementById(id);
 let catalog={keys:[],models:[]},app,globalLoaded=false;
 let appliedCatalogAt=0;
+const version=chrome.runtime.getManifest().version;
+if(version)$('appVersion').textContent=version;
 const defaultEditor=$('defaultStrategyForm');
 function showView(view){
   for(const panel of document.querySelectorAll('[data-panel]'))panel.hidden=panel.dataset.panel!==view;
@@ -77,12 +79,12 @@ const warningLabels={
 const badgeNumber=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:2});
 const channelPriceNumber=new Intl.NumberFormat('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:8,useGrouping:false});
 const channelPriceFields=[['input_per_million','输入'],['output_per_million','输出'],['cache_input_per_million','缓存输入'],['cache_write_per_million','缓存写入']];
-function candidateBadgeCells(config,choice,now){
+function candidateBadgeCells(choice,now){
   const details=providerBadgeDetails(choice.hall,now),rank=details?.popularity;
   const popularity=node('td',rank?`${rank.rank} / ${rank.groups} · ${rank.window}`:'未知');
   popularity.dataset.label='消费名次';
   if(rank){
-    popularity.title=`${config.platform} 同类分组的消费排名`;
+    popularity.title='平台同类分组的消费排名';
     if(rank.history_partial===true)popularity.append(node('div','历史不完整','muted'));
   }
 
@@ -113,7 +115,7 @@ function channelPriceLines(price){
   }
   return lines;
 }
-function priceUnavailableTable(config,choices){
+function priceUnavailableTable(choices){
   const wrap=node('div',null,'table-wrap'),table=node('table'),head=node('thead'),header=node('tr'),body=node('tbody');
   const columns=['渠道','价格状态','渠道价（1×）','消费名次','平台告警'];
   header.append(...columns.map(label=>node('th',label)));
@@ -128,22 +130,31 @@ function priceUnavailableTable(config,choices){
     const lines=channelPriceLines(choice.channelPrice);
     if(lines.length)price.append(...lines.map(line=>node('div',line)));
     else price.textContent='未知';
-    row.append(channel,status,price,...candidateBadgeCells(config,choice,now));
+    row.append(channel,status,price,...candidateBadgeCells(choice,now));
     body.append(row);
   }
   table.append(head,body);
   wrap.append(table);
   return wrap;
 }
-function confirmSwitch(config,state,target){
-  const dialog=node('dialog');dialog.append(node('h2','确认手动切换'),node('p',`Key ${config.keyId} · ${config.model}`),node('p',`当前分组 ${state.expectedGroupId} → ${target.code} [${target.id}]`),node('p','确认后会真实修改首选分组，并暂停此 key 的自动选择。平台故障转移设置保持原样。'));
-  const actions=node('div',null,'actions'),cancel=node('button','取消','quiet'),confirm=node('button','确认切换');
-  cancel.onclick=()=>dialog.close();confirm.onclick=()=>{dialog.close();act(()=>send({type:'manualSwitch',keyId:config.keyId,target:target.id,expectedGroupId:state.expectedGroupId}));};
+function confirmAction(title,details,confirmLabel,message){
+  const dialog=node('dialog');
+  dialog.append(node('h2',title),...details.map(detail=>node('p',detail)));
+  const actions=node('div',null,'actions'),cancel=node('button','取消','quiet'),confirm=node('button',confirmLabel);
+  cancel.autofocus=true;
+  cancel.onclick=()=>dialog.close();
+  confirm.onclick=()=>{dialog.close();act(()=>send(message));};
   dialog.addEventListener('close',()=>dialog.remove());actions.append(cancel,confirm);dialog.append(actions);document.body.append(dialog);dialog.showModal();
+}
+function confirmSwitch(config,state,target){
+  confirmAction('确认手动切换',[
+    'Key '+config.keyId+' · '+config.model,'当前分组 '+state.expectedGroupId+' → '+target.code+' ['+target.id+']',
+    '确认后会修改首选分组，并暂停此 key 的自动选择。平台故障转移设置保持原样。'
+  ],'确认切换',{type:'manualSwitch',keyId:config.keyId,target:target.id,expectedGroupId:state.expectedGroupId});
 }
 function candidateTable(config,state){
   const wrap=node('div',null,'table-wrap'),table=node('table'),head=node('thead'),header=node('tr');
-  const columns=[['code','渠道',v=>v],['rawMultiplier','原始倍率',v=>v+'×'],['accountMultiplier','账号倍率',v=>v+'×'],['stars','用户评分',v=>'★ '+v.toFixed(2)],['cost','真实价格',v=>'￥'+v.toFixed(6)+'/M'],['latency','首响应延迟',v=>Math.round(v)+' ms'],['success','成功率',v=>(v*100).toFixed(2)+'%'],['cacheHit','缓存率',v=>(v*100).toFixed(2)+'%'],['detection','模型检测',v=>v]];
+  const columns=[['code','渠道',v=>v],['rawMultiplier','原始倍率',v=>v+'×'],['accountMultiplier','账号倍率',v=>v+'×'],['stars','用户评分',v=>'★ '+v.toFixed(2)],['cost','模型价格',v=>'$'+v.toFixed(6)+'/M'],['latency','首响应延迟',v=>Math.round(v)+' ms'],['success','成功率',v=>(v*100).toFixed(2)+'%'],['cacheHit','缓存率',v=>(v*100).toFixed(2)+'%'],['detection','模型检测',v=>v]];
   const sort=viewSort.get(config.keyId)||{key:'score',direction:-1};
   const sortLabel=node('label','排序显示','compact-sort');const sortSelect=node('select');
   option(sortSelect,'score:-1',['accountMultiplier','rate'].includes(state.rankingBasis)?'策略排序 · 账号倍率低优先':state.rankingBasis==='cacheHit'?'策略排序 · 缓存率高优先':'策略排序');
@@ -151,7 +162,7 @@ function candidateTable(config,state){
   sortSelect.value=sort.key+':'+sort.direction;
   sortSelect.onchange=()=>{const [key,direction]=sortSelect.value.split(':');viewSort.set(config.keyId,{key,direction:Number(direction)});refresh().catch(e=>$('message').textContent=e.message);};
   sortLabel.append(sortSelect);wrap.append(sortLabel);
-  if(state.rankingBasis==='accountMultiplier')wrap.append(node('p','全部合格渠道的真实价格缺失，本轮按账号倍率从低到高选择；同倍率保留当前渠道。','muted'));
+  if(state.rankingBasis==='accountMultiplier')wrap.append(node('p','全部合格渠道的模型价格缺失，本轮按账号倍率从低到高选择；同倍率保留当前渠道。','muted'));
   if(state.rankingBasis==='rate')wrap.append(node('p','按账号倍率从低到高选择；同倍率保留当前渠道。','muted'));
   if(state.rankingBasis==='cacheHit')wrap.append(node('p','按指定模型的 1h 缓存命中率从高到低选择；同缓存率保留当前渠道，缓存数据缺失或过期的渠道会被排除。','muted'));
   for(const [key,label] of columns){const th=node('th'),button=node('button',label+(sort.key===key?(sort.direction===1?' ↑':' ↓'):''),'column-sort');button.onclick=()=>{viewSort.set(config.keyId,{key,direction:sort.key===key?-sort.direction:['score','success','stars'].includes(key)?-1:1});refresh().catch(e=>$('message').textContent=e.message);};th.append(button);header.append(th);}
@@ -164,11 +175,7 @@ function candidateTable(config,state){
     for(const [key,label,formatter] of columns){
       const value=key==='code'?`${choice.code} [${choice.id}]`:format(choice[key],formatter);
       const td=node('td',value);
-      if(key==='cost' && choice.estimated){
-        const label=node('small',`${choice.estimateKind==='cache-rate'?'缓存率 × 账号倍率估算':'样本估算'} · ${choice.priceSamples} 条样本`,'price-estimate');
-        if(choice.estimateBasis){const b=choice.estimateBasis;label.title=`按平台计价单位估算每百万输入 Token：${b.accountMultiplier} × [${b.inputPrice} × (1 − ${(b.cacheHit*100).toFixed(2)}%) + ${b.cacheInputPrice} × ${(b.cacheHit*100).toFixed(2)}%]；输出与单独计费的缓存写入另计。`;}
-        td.append(label);
-      }
+
       if(key==='cost' && choice.cost==null && choice.priceReason){
         td.append(node('div',choice.priceReason,'muted'));
         const lines=channelPriceLines(choice.channelPrice);
@@ -177,7 +184,7 @@ function candidateTable(config,state){
       td.dataset.label=label;
       row.append(td);
     }
-    row.append(...candidateBadgeCells(config,choice,now));
+    row.append(...candidateBadgeCells(choice,now));
     const cell=node('td');cell.dataset.label='操作';if(choice.id===state.expectedGroupId)cell.append(node('span','当前','badge'));else{const button=node('button','切换','quiet');button.setAttribute('aria-label',`切换到 ${choice.code}`);button.disabled=!!state.pending;button.onclick=()=>confirmSwitch(config,state,choice);cell.append(button);}row.append(cell);body.append(row);
   }
   table.append(body);wrap.append(table);return wrap;
@@ -187,7 +194,7 @@ function fillCatalog(){
   $('keyId').replaceChildren();option($('keyId'),'','选择已有 key');
   for(const k of catalog.keys)option($('keyId'),String(k.id),`${k.name} · ID ${k.id} · 当前分组 ${k.groupId}`);
   $('model').replaceChildren();option($('model'),'','选择此 key 固定使用的模型');
-  for(const m of catalog.models)option($('model'),JSON.stringify(m),`${({openai:'OpenAI',kimi:'Kimi',zhipu:'智谱 GLM',grok:'Grok',deepseek:'DeepSeek',gemini:'Gemini'})[m.platform]||m.platform} / ${m.model}`);
+  for(const model of new Set(catalog.models.map(m=>m.model)))option($('model'),JSON.stringify({model}),model);
   if(selectedModel&&!Array.from($('model').options).some(x=>x.value===selectedModel))option($('model'),selectedModel,'此前选择的模型（本轮平台未列出）');
   $('keyId').value=selectedKey;$('model').value=selectedModel;
 }
@@ -204,7 +211,7 @@ async function refresh(){
   $('connection').textContent=data.connected?'平台已连接':'等待连接';
   $('connection').classList.toggle('connected',data.connected);
   $('monitorCount').textContent=app.configs.length;
-  $('overview').replaceChildren(...[['自动运行',app.configs.filter(c=>!c.paused&&c.automatic).length],['仅预览',app.configs.filter(c=>!c.paused&&!c.automatic).length],['已暂停',app.configs.filter(c=>c.paused).length]].map(([label,value])=>{const stat=node('div',null,'stat');stat.append(node('strong',String(value)),node('span',label));return stat;}));
+  $('overview').replaceChildren(...[['自动运行',app.configs.filter(c=>!c.paused&&c.automatic).length,'auto'],['仅预览',app.configs.filter(c=>!c.paused&&!c.automatic).length,'preview'],['已暂停',app.configs.filter(c=>c.paused).length,'paused']].map(([label,value,tone])=>{const stat=node('div',null,'stat '+tone);stat.append(node('strong',String(value)),node('span',label));return stat;}));
   $('lastCheck').textContent=`每 ${app.checkMinutes||5} 分钟检查 · ${app.lastCheck?'上次完成 '+new Date(app.lastCheck).toLocaleString():'尚未完成检查'} · 模型目录${catalog.at?'更新于 '+new Date(catalog.at).toLocaleTimeString():'尚未读取'}${app.lastError?' · '+app.lastError:''}`;
   $('monitors').replaceChildren();
   if(!app.configs.length){const empty=node('div',null,'empty-state'),button=node('button','添加第一个监控');button.onclick=addMonitor;empty.append(node('strong','让每个模型找到合适的渠道'),node('p','还没有监控。先连接平台，再绑定 key 和模型。'),button);$('monitors').append(empty);}
@@ -214,7 +221,7 @@ async function refresh(){
     const top=node('div',null,'monitor-top'),name=node('div',null,'monitor-name');name.append(node('h3',`${c.model} · Key ${c.keyId}`));top.append(name,node('span',c.paused?'已暂停':c.automatic?'自动运行':'仅预览',`badge ${c.paused?'paused':c.automatic?'auto':'preview'}`));
     box.append(top,node('p',`${c.paused?'已暂停':c.automatic?'自动切换':'仅预览'} · ${s.status||'等待检查'}`,'monitor-status'),node('p',`${groupText} · ${strategyLabel(c.strategy)}`,'monitor-meta'));
     const current=s.choices?.find(x=>x.id===s.expectedGroupId);
-    if(current){const summary=node('div',null,'current-summary'),price=node('span',current.cost==null?'真实价格未知':'￥'+current.cost.toFixed(6),'price');if(current.cost!=null)price.append(node('small',' /M'));summary.append(node('span','当前渠道','eyebrow'),node('span',current.code,'channel'),price);if(current.estimated)summary.append(node('span',current.estimateKind==='cache-rate'?'缓存率 × 账号倍率估算':'样本估算','badge preview'));box.append(summary);}
+    if(current){const summary=node('div',null,'current-summary'),price=node('span',current.cost==null?'模型价格未知':'$'+current.cost.toFixed(6),'price');if(current.cost!=null)price.append(node('small',' /M'));summary.append(node('span','当前渠道','eyebrow'),node('span',current.code,'channel'),price);box.append(summary);}
     if(Array.isArray(s.choices)){const details=node('details',null,'candidate-details');details.open=expandedCandidates.has(c.keyId);details.addEventListener('toggle',()=>{if(details.open)expandedCandidates.add(c.keyId);else expandedCandidates.delete(c.keyId);});details.append(node('summary',`合格候选 · ${s.choices.length} 个`));if(s.choices.length)details.append(candidateTable(c,s),node('p','显示排序不影响自动策略。手动切换会重新验证资格，并暂停此 key 的自动选择。','muted'));else details.append(node('p','当前没有符合筛选条件的渠道。展开下方“未参与比较”查看原因；下轮检查会重新评估。','muted'));box.append(details);}
     if(s.excluded&&Object.keys(s.excluded).length){
       const details=node('details',null,'exclusions'),list=node('div',null,'exclusion-list');
@@ -227,7 +234,7 @@ async function refresh(){
       }
       details.append(node('summary',`未参与比较 · ${Object.values(s.excluded).reduce((a,b)=>a+b,0)} 个渠道`),list);
       if(s.priceUnavailableChoices?.length){
-        details.append(node('p','真实价格暂不可用的渠道 · 渠道价按 1×、每百万 Token 展示。','muted'),priceUnavailableTable(c,s.priceUnavailableChoices));
+        details.append(node('p','模型价格暂不可用的渠道 · 渠道价按 1×、每百万 Token 展示。','muted'),priceUnavailableTable(s.priceUnavailableChoices));
       }
       box.append(details);
     }
@@ -235,9 +242,11 @@ async function refresh(){
     for(const [field,label,checked] of [['automatic','自动改组',c.automatic],['requireDetection','排除检测未通过',c.strategy.requireDetection!==false],['excludeWarnings','排除平台告警',c.excludeWarnings===true]]){
       const wrapper=node('label',null,'checkbox'),input=node('input');input.type='checkbox';input.checked=checked;input.disabled=!!s.pending;
       input.onchange=()=>act(()=>send({type:'toggleKey',keyId:c.keyId,field,enabled:input.checked}));
-      wrapper.append(input,document.createTextNode(label));controls.append(wrapper);
+      wrapper.append(input,document.createTextNode(label));
+      if(field==='automatic')wrapper.append(node('span','开启后会自动修改该 Key 的分组','muted'));
+      controls.append(wrapper);
     }
-    box.append(controls);
+    const footer=node('div',null,'monitor-footer');
     const actions=node('div',null,'actions');
     const adjust=node('button','调整策略','quiet');
     adjust.onclick=()=>{
@@ -248,17 +257,17 @@ async function refresh(){
     actions.append(adjust);
     const edit=node('button','编辑绑定','quiet');edit.addEventListener('click',()=>act(async()=>{
       if(!catalog.keys.length){catalog=await send({type:'catalog'});fillCatalog();}
-      $('keyId').value=String(c.keyId);$('model').value=JSON.stringify({platform:c.platform,model:c.model});$('automatic').checked=c.automatic;
+      $('keyId').value=String(c.keyId);$('model').value=JSON.stringify({model:c.model});$('automatic').checked=c.automatic;
       showView('settings');$('configForm').scrollIntoView({behavior:'smooth',block:'center'});$('message').textContent='已载入 Key 与绑定模型。';
     }));actions.append(edit);
     const pauseResume=node('button',c.paused?'恢复':'暂停','quiet');
     pauseResume.onclick=()=>act(()=>send({type:c.paused?'resume':'pause',keyId:c.keyId}));
     actions.append(pauseResume);
-    const remove=node('button','移除监控','quiet danger');remove.onclick=()=>act(()=>send({type:'remove',keyId:c.keyId}));actions.append(remove);box.append(actions);
+    const remove=node('button','移除监控','quiet danger');remove.onclick=()=>confirmAction('确认移除监控',['Key '+c.keyId+' · '+c.model,'移除后将停止此 Key 的检查和自动改组。'],'确认移除',{type:'remove',keyId:c.keyId});actions.append(remove);footer.append(controls,actions);box.append(footer);
     const editor=strategyEditors.get(c.keyId);if(editor)box.append(editor);
     $('monitors').append(box);
   }
-  $('logs').replaceChildren(...app.logs.map(l=>node('li',`${new Date(l.at).toLocaleString()} · ${l.text}`)));
+  $('logs').replaceChildren(...app.logs.map(l=>{const item=node('li'),time=node('time',new Date(l.at).toLocaleString());time.dateTime=new Date(l.at).toISOString();item.append(time,node('span',l.text));return item;}));
   if(!app.logs.length)$('logs').append(node('li','暂无记录。连接平台并添加监控后，检查与切换动态会显示在这里。'));
 }
 async function act(fn){
@@ -267,11 +276,11 @@ async function act(fn){
   try{await fn();if($('message').textContent==='正在处理…')$('message').textContent='已完成';$('message').dataset.tone='success';await refresh();if($('message').textContent==='已完成')messageTimer=setTimeout(()=>{$('message').textContent='';},4500);}catch(e){$('message').textContent=e.message;$('message').dataset.tone='error';}finally{buttons.forEach(b=>b.disabled=false);}
 }
 $('catalog').onclick=()=>act(async()=>{catalog=await send({type:'catalog'});fillCatalog();});
-$('disconnect').onclick=()=>act(()=>send({type:'disconnect'}));
-$('resetAccount').onclick=()=>act(()=>send({type:'resetAccount'}));
+$('disconnect').onclick=()=>confirmAction('确认断开并暂停',['将断开平台连接并暂停全部监控。'],'确认断开',{type:'disconnect'});
+$('resetAccount').onclick=()=>confirmAction('确认清空账号绑定',['移除全部监控后，可清空保存的账号绑定并连接其他账号。'],'确认清空',{type:'resetAccount'});
 $('check').onclick=()=>act(()=>send({type:'check'}));
 defaultEditor.onsubmit=event=>{event.preventDefault();act(()=>send({type:'strategy',strategy:readEditor(defaultEditor,defaultEditor.elements.requireDetection.checked),checkMinutes:Number($('checkMinutes').value)}));};
-$('keyId').onchange=()=>{const c=app?.configs.find(c=>c.keyId===Number($('keyId').value));$('automatic').checked=c?.automatic===true;if(c)$('model').value=JSON.stringify({platform:c.platform,model:c.model});};
+$('keyId').onchange=()=>{const c=app?.configs.find(c=>c.keyId===Number($('keyId').value));$('automatic').checked=c?.automatic===true;if(c)$('model').value=JSON.stringify({model:c.model});};
 $('configForm').onsubmit=event=>{event.preventDefault();act(async()=>{const m=JSON.parse($('model').value);await send({type:'configure',keyId:Number($('keyId').value),...m,automatic:$('automatic').checked});showView('monitors');});};
 refresh().catch(e=>$('message').textContent=e.message);
 setInterval(()=>{if(!document.querySelector('dialog[open]')&&!document.activeElement?.matches('input,select'))refresh().catch(()=>{});},20000);

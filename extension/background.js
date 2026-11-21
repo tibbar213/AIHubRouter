@@ -1,4 +1,4 @@
-import {decide,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,DEFAULT_STRATEGY,PLATFORMS,INTERVAL} from './core.js';
+import {decide,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,DEFAULT_STRATEGY,INTERVAL} from './core.js';
 const ORIGIN='https://aihub.top', ALARM='aihub-check';
 const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:8,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
 let queue=Promise.resolve();
@@ -86,7 +86,7 @@ async function authorizedSnapshot(){
   return snapshot;
 }
 function catalogData(all,snapshot){
-  const models=[...new Map(snapshot.items.filter(g=>typeof g.platform==='string' && g.platform.length>0 && g.platform.length<=100).flatMap(g=>(g.group_models||[]).filter(m=>typeof m.model==='string' && m.model.length>0 && m.model.length<=200).map(m=>[JSON.stringify([g.platform,m.model]),{platform:g.platform,model:m.model}]))).values()].sort((a,b)=>a.platform.localeCompare(b.platform)||a.model.localeCompare(b.model));
+  const models=[...new Set(snapshot.items.flatMap(g=>(g.group_models||[]).map(m=>m.model).filter(model=>typeof model==='string' && model.length>0 && model.length<=200)))].sort((a,b)=>a.localeCompare(b)).map(model=>({model}));
   return {keys:all,models,at:Date.now()};
 }
 function errorText(e){return ({AUTH:'网站登录已失效，请打开平台并重新登录或刷新页面',NETWORK:'平台连接失败，将在下轮重试',FORBIDDEN:'平台拒绝请求，请检查登录状态或分组权限',FORMAT:'平台返回的数据无法识别，本轮未切换',STALE:'平台数据已过期或时间异常，本轮未切换，将在下轮重试',BUSINESS:'平台未确认操作成功，请检查后重试',HTTP:'平台服务异常，本轮停止',ACCOUNT:'当前账号与监控配置不一致',TAB_TIMEOUT:'读取已打开的 AIHub 页面超时，请刷新该页面后重试'})[e.message]||'检查未完成，本轮停止';}
@@ -210,15 +210,15 @@ async function handle(message,pauseRequest,disconnectRequest){
   }
   if(message.type==='configure'){
     if(app.accountMismatch)throw new Error('ACCOUNT');
-    if(!Number.isSafeInteger(message.keyId)||typeof message.platform!=='string'||!message.platform.length||message.platform.length>100||typeof message.model!=='string'||!message.model.length||message.model.length>200)throw new Error('FORMAT');
+    if(!Number.isSafeInteger(message.keyId)||typeof message.model!=='string'||!message.model.length||message.model.length>200)throw new Error('FORMAT');
     const old=app.configs.find(c=>c.keyId===message.keyId);
     const strategy=validateStrategy(message.strategy??old?.strategy??app.defaultStrategy);
     await identity(app);
     const k=(await keys()).find(k=>k.id===message.keyId);if(!k)throw new Error('FORMAT');
     const snapshot=await providers();
-    if(!snapshot.items.some(g=>g.platform===message.platform && g.group_models?.some(m=>m.model===message.model)))throw new Error('FORMAT');
+    if(!snapshot.items.some(g=>g.group_models?.some(m=>m.model===message.model)))throw new Error('FORMAT');
     if(app.states[message.keyId]?.pending)throw new Error('请先检查并核实上次切换结果');
-    const config={keyId:message.keyId,model:message.model,platform:message.platform,strategy,automatic:message.automatic===true,paused:false};
+    const config={keyId:message.keyId,model:message.model,strategy,automatic:message.automatic===true,paused:false};
     if(urgentPause.get(message.keyId)===pauseRequest)urgentPause.delete(message.keyId);
     if(disconnectRequested===disconnectRequest)disconnectRequested=false;
     if(old)Object.assign(old,config);else app.configs.push(config);

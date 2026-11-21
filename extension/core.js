@@ -1,6 +1,7 @@
-export const PLATFORMS = ['openai','kimi','zhipu','grok','deepseek','gemini'];
 export const INTERVAL = 300000;
-export const PRICE_SOURCE = 'platform-effective-price-v1';
+// Model price comparison weights for input and output tokens.
+const INPUT_PRICE_WEIGHT = 3;
+const OUTPUT_PRICE_WEIGHT = 1;
 export const DEFAULT_RULES=Object.freeze({minSuccess:0,minCacheHit:0,minSamples:0,maxLatency:0,maxPrice:0,maxRate:0,allowIds:Object.freeze([]),denyIds:Object.freeze([]),confirmRounds:1,cooldownMinutes:0,minImprovement:0});
 export const DEFAULT_STRATEGY = Object.freeze({mode:'price',weights:Object.freeze({price:70,latency:20,success:10}),requireDetection:true,rules:DEFAULT_RULES});
 export function validateStrategy(strategy) {
@@ -29,9 +30,9 @@ export function detectionInfo(group,model){
 }
 export function strategyLabel(strategy) {
   const s=validateStrategy(strategy);
-  if(s.mode!=='weighted')return {price:'真实价格优先',rate:'账号倍率优先',cacheHit:'缓存率更高优先',latency:'首响应更快优先',success:'成功率更高优先'}[s.mode];
+  if(s.mode!=='weighted')return {price:'模型价格优先',rate:'账号倍率优先',cacheHit:'缓存率更高优先',latency:'首响应更快优先',success:'成功率更高优先'}[s.mode];
   const total=Object.values(s.weights).reduce((a,b)=>a+b,0);
-  return `加权：价格 ${(s.weights.price/total*100).toFixed(1)}% · 延迟 ${(s.weights.latency/total*100).toFixed(1)}% · 成功率 ${(s.weights.success/total*100).toFixed(1)}%`;
+  return `加权：模型价格 ${(s.weights.price/total*100).toFixed(1)}% · 延迟 ${(s.weights.latency/total*100).toFixed(1)}% · 成功率 ${(s.weights.success/total*100).toFixed(1)}%`;
 }
 const validPrice = x => typeof x === 'number' && Number.isFinite(x) && x >= 0;
 function modelCacheHit(summary,now){
@@ -41,60 +42,17 @@ function modelCacheHit(summary,now){
     Number.isFinite(refreshed) && now-refreshed<=INTERVAL && refreshed<=now+60000 &&
     validPrice(cache.cache_hit_rate) && cache.cache_hit_rate<=1 ? cache.cache_hit_rate : null;
 }
-function cacheRateEstimate(group,model,summary,now){
-  const cacheHit=modelCacheHit(summary,now);
-  if(cacheHit===null)return {reason:'指定模型缓存率未知或数据未就绪'};
-  if(!validPrice(group.rate_multiplier))return {reason:'账号倍率无效，无法估算价格'};
-  // The platform's effective price is SOL-equivalent, not the public USD model price.
-  // Recover its cache-read basis from the exact model's normalized sample cost.
-  const sample=summary.range_cache.pricing_models?.[model];
-  if(!sample || !validPrice(sample.baseline_input_per_million) || !validPrice(sample.sol_equivalent_unit_price) ||
-    !Number.isSafeInteger(sample.usage_records) || sample.usage_records<=0 ||
-    !['input_tokens','cache_read_tokens','cache_creation_tokens'].every(k=>Number.isSafeInteger(sample[k])&&sample[k]>=0))return {reason:'指定模型等效计价基准或样本缺失'};
-  if(sample.cache_creation_tokens!==0 || sample.unknown_context_records!==0 || sample.long_input_tokens!==0 || sample.long_cache_read_tokens!==0 || sample.long_cache_creation_tokens!==0)return {reason:'缓存率估算样本含缓存写入、长上下文或上下文不明确'};
-  const baseline=sample.baseline_input_per_million,total=sample.input_tokens+sample.cache_read_tokens;
-  if(!Number.isSafeInteger(total)||total<=0 || (sample.cache_read_tokens===0&&cacheHit>0))return {reason:'指定模型缓存读取计价基准缺失'};
-  const recovered=sample.cache_read_tokens>0?(sample.sol_equivalent_unit_price*total-baseline*sample.input_tokens)/sample.cache_read_tokens:baseline;
-  if(!Number.isFinite(recovered)||recovered< -1e-9)return {reason:'指定模型等效计价基准不一致'};
-  const cachePrice=Math.max(0,recovered);
-  const cost=group.rate_multiplier*(baseline*(1-cacheHit)+cachePrice*cacheHit);
-  return validPrice(cost)?{cost,predictedMultiplier:null,estimated:true,estimateKind:'cache-rate',sampleCount:summary.range_cache.usage_records,
-    estimateBasis:{inputPrice:baseline,cacheInputPrice:cachePrice,cacheHit,accountMultiplier:group.rate_multiplier}
-  }:{reason:'缓存率估算价格无效'};
-}
-function priceAssessment(group, model, now) {
-  // Match ProviderHall's selected-model projection and effectivePrice sort.
-  // The predicted multiplier is a companion display value, never another price unit.
-  const summary = group.summary_models?.[model];
-  if (!summary) return {reason:'平台未返回指定模型的计价数据'};
-  const cache = summary.range_cache;
-  if (cache?.stale === true) return {reason:'指定模型计价数据已过期'};
-  if (!validPrice(summary.effective_input_price_per_million)) {
-    const estimated=cacheRateEstimate(group,model,summary,now);
-    if(!estimated.reason)return estimated;
-    const reason = summary.effective_multiplier_reason;
-    if (reason === 'no_qualifying_requests' || reason === 'no_samples') return {reason:'指定模型没有可计价样本'};
-    if (reason !== 'insufficient_samples') return {reason:modelCacheHit(summary,now)===null?'指定模型真实价格缺失或未就绪':estimated.reason};
-    if (cache?.ready !== true || cache.coverage_complete !== true || cache.stale !== false) return {reason:'指定模型估算数据未就绪或不完整'};
-    const refreshed = Date.parse(cache.refreshed_at);
-    if (!Number.isFinite(refreshed) || now - refreshed > INTERVAL || refreshed > now + 60000) return {reason:'指定模型估算数据过期或时间异常'};
-    const sample = cache.pricing_models?.[model];
-    if (!sample || !Number.isSafeInteger(sample.usage_records) || sample.usage_records <= 0 || !validPrice(sample.sol_equivalent_unit_price)) return {reason:'指定模型估算样本或等效单价缺失'};
-    const publicRate = group.public_rate_multiplier ?? group.rate_multiplier;
-    if (!validPrice(publicRate) || !validPrice(group.rate_multiplier)) return {reason:'渠道倍率无效，无法估算价格'};
-    if (publicRate !== group.rate_multiplier) return {reason:'账号倍率与公开倍率不同，无法估算价格'};
-    if (sample.unknown_context_records !== 0 || sample.long_input_tokens !== 0 || sample.long_cache_read_tokens !== 0 || sample.long_cache_creation_tokens !== 0) return {reason:'估算样本含长上下文或上下文不明确'};
-    const cost = sample.sol_equivalent_unit_price * publicRate;
-    return validPrice(cost) ? {cost,predictedMultiplier:null,estimated:true,sampleCount:sample.usage_records} : {reason:'估算价格无效'};
-  }
-  if (cache?.ready === false) return {reason:'指定模型计价数据未就绪'};
-  return {
-    cost: summary.effective_input_price_per_million,
-    predictedMultiplier: summary.effective_multiplier_ready === true && validPrice(summary.effective_multiplier) ? summary.effective_multiplier : null
-  };
+function priceAssessment(price, rateMultiplier) {
+  const input = price?.input_per_million, output = price?.output_per_million;
+  if (!validPrice(input) || !validPrice(output)) return {reason:'指定模型标价缺失或无效'};
+  if (!validPrice(rateMultiplier)) return {reason:'账号倍率无效，无法计算模型价格'};
+  const totalWeight = INPUT_PRICE_WEIGHT + OUTPUT_PRICE_WEIGHT;
+  const cost = ((INPUT_PRICE_WEIGHT / totalWeight) * input + (OUTPUT_PRICE_WEIGHT / totalWeight) * output) * rateMultiplier;
+  return validPrice(cost) ? {cost,predictedMultiplier:null} : {reason:'模型价格无效'};
 }
 export function platformPrice(group, model, now=Date.now()) {
-  const result = priceAssessment(group, model, now);
+  const price = group?.group_models?.find(entry=>entry.model===model)?.price;
+  const result = priceAssessment(price, group?.rate_multiplier);
   return result.reason ? null : result;
 }
 export function migrateApp(app) {
@@ -130,7 +88,8 @@ export function resetStrategyCheck(state,status){
 export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) {
   strategy=validateStrategy(strategy);
   const rules=strategy.rules;
-  if (!group || typeof group.platform!=='string' || group.platform!==config.platform) return {reason:'模型系列不匹配'};
+  const model=group?.group_models?.find(x=>x.model===config.model);
+  if (!model) return {reason:'指定模型未列出'};
   if (snapshot.stale!==false || !Number.isFinite(Date.parse(snapshot.generated_at)) || now-Date.parse(snapshot.generated_at)>INTERVAL || Date.parse(snapshot.generated_at)>now+60000) return {reason:'价格快照未知或过期'};
   if (group.bindable!==true) return {reason:'当前账号不可绑定'};
   if (group.detections_enabled===false || group.probe_skipped===true) return {reason:'分组未启用探测'};
@@ -144,16 +103,15 @@ export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) 
   if(rules.maxRate>0 && (!validPrice(group.rate_multiplier)||group.rate_multiplier>rules.maxRate))return {reason:'超过自定义倍率上限'};
   if (group.key_max_rate_multiplier>0 && group.rate_multiplier>group.key_max_rate_multiplier) return {reason:'超过此 key 的倍率上限'};
   if (requiresGroupProbe && !(Date.parse(group.probe_expires_at)>now)) return {reason:'分组探测过期'};
-  const model=group.group_models?.find(x=>x.model===config.model);
   const card=group.model_cards?.find(x=>x.model===config.model);
-  if (!model || !card || card.health!=='healthy') return {reason:'指定模型未列出或不健康'};
+  if (!card || card.health!=='healthy') return {reason:'指定模型未列出或不健康'};
   if (card.probe_state!=='enabled' && (requiresGroupProbe || card.probe_state!==undefined)) return {reason:'指定模型未启用探测'};
   if (!(Date.parse(card.health_expires_at)>now)) return {reason:'模型健康状态过期'};
   const detection=detectionInfo(group,config.model);
   if(strategy.requireDetection!==false && !detection.passed)return {reason:'检测未通过'};
   if(config.excludeWarnings===true && providerBadgeDetails(channelSummary(group).hall,now)?.warnings.length)return {reason:'平台告警'};
   if (group.subscription_type!=='standard') return {reason:'非按量分组'};
-  const metric=priceAssessment(group,config.model,now);
+  const metric=priceAssessment(model.price,group.rate_multiplier);
   const summary=group.summary_models?.[config.model];
   const cacheHit=modelCacheHit(summary,now);
   const samples=validPrice(summary?.sample_count)&&Number.isInteger(summary.sample_count)?summary.sample_count:null;
@@ -166,12 +124,12 @@ export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) 
   if(rules.minCacheHit>0 && (cacheHit===null || cacheHit*100<rules.minCacheHit))return {reason:cacheHit===null?'指定模型缓存率未知或数据未就绪':'缓存率低于下限'};
   if(rules.maxLatency>0 && (latency===null || latency>rules.maxLatency))return {reason:'延迟超过上限或未知'};
   if(rules.maxPrice>0 && metrics.price===null)return missingPrice;
-  if(rules.maxPrice>0 && metrics.price>rules.maxPrice)return {reason:'真实价格超过上限'};
+  if(rules.maxPrice>0 && metrics.price>rules.maxPrice)return {reason:'模型价格超过上限'};
   const required=strategy.mode==='weighted' ? Object.keys(strategy.weights).filter(k=>strategy.weights[k]>0) : [strategy.mode];
   const missing=required.find(k=>k!=='price' && metrics[k]===null);
   if(missing)return {reason:{rate:'账号倍率无效或未知',cacheHit:'指定模型缓存率未知或数据未就绪',latency:'指定模型首响应延迟缺失或无样本',success:'指定模型成功率缺失或无样本'}[missing]};
-  return {cost:metrics.price,predictedMultiplier:metric?.predictedMultiplier??null,estimated:metric?.estimated===true,priceSamples:metric?.sampleCount??null,latency,success,cacheHit,metrics,detection:detection.label,
-    estimateKind:metric.estimateKind,estimateBasis:metric.estimateBasis,priceReason:metric.reason,channelPrice:metric.reason?model.price:undefined
+  return {cost:metrics.price,latency,success,cacheHit,metrics,detection:detection.label,
+    priceReason:metric.reason,channelPrice:metric.reason?model.price:undefined
   };
 }
 export function rankChoices(choices,strategy) {
@@ -244,7 +202,7 @@ export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),g
   if (state.pending) return reset('等待核实上次切换');
   if (state.expectedGroupId!=null && state.expectedGroupId!==currentGroupId) return {target:null,externalChange:true,state:{...next,expectedGroupId:currentGroupId,observedGroupId:undefined,candidate:null,count:0,observedAt:undefined,status:'检测到分组变化，已更新并等待下轮检查'}};
   next.expectedGroupId=currentGroupId;
-  const assessed=(snapshot.items||[]).filter(g=>g.platform===config.platform).map(g=>({group:g,...assess(g,config,snapshot,now,strategy)}));
+  const assessed=(snapshot.items||[]).filter(g=>g?.group_models?.some(m=>m.model===config.model)).map(g=>({group:g,...assess(g,config,snapshot,now,strategy)}));
   next.excluded=Object.fromEntries([...new Set(assessed.filter(x=>x.reason).map(x=>x.reason))].map(reason=>[reason,assessed.filter(x=>x.reason===reason).length]));
   next.priceUnavailableChoices=assessed.filter(x=>x.priceUnavailable).map(x=>({
     ...channelSummary(x.group),reason:x.reason,channelPrice:x.channelPrice
@@ -253,17 +211,17 @@ export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),g
   const rateFallback=strategy.mode==='price' && choices.length>0 && choices.every(x=>x.cost===null);
   next.rankingBasis=rateFallback?'accountMultiplier':strategy.mode;
   if(state.rankingBasis!==next.rankingBasis)state={...state,candidate:null,count:0,observedAt:undefined};
-  next.choices=choices.map(x=>({...channelSummary(x.group),cost:x.cost,predictedMultiplier:x.predictedMultiplier,estimated:x.estimated,priceSamples:x.priceSamples,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection,
-    cacheHit:x.cacheHit,estimateKind:x.estimateKind,estimateBasis:x.estimateBasis,priceReason:x.priceReason,channelPrice:x.channelPrice
+  next.choices=choices.map(x=>({...channelSummary(x.group),cost:x.cost,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection,
+    cacheHit:x.cacheHit,priceReason:x.priceReason,channelPrice:x.channelPrice
   }));
   if (!choices.length) return {...reset('没有合格分组，保留当前'),notice:'no-candidate'};
   const current=choices.find(x=>x.group.group_id===currentGroupId), best=choices[0];
   const usesPrice=strategy.mode==='price' || (strategy.mode==='weighted' && strategy.weights.price>0);
-  const basis=rateFallback?'全部真实价格缺失，按账号倍率：':'';
-  if(rateFallback && best.score===null)return reset('全部真实价格缺失，账号倍率也不可比较，保留当前');
-  if (current?.cost===null && usesPrice && !rateFallback) return reset('当前分组可用，真实价格暂不可比较');
-  if(rateFallback && current && current.score===null)return reset('全部真实价格缺失，当前账号倍率未知，保留当前');
-  if (current && current.score>=best.score-1e-9) return reset(rateFallback?'全部真实价格缺失，当前账号倍率最低（同倍率不切）':strategy.mode==='rate'?'当前账号倍率最低（同倍率不切）':'当前分组已是策略最优（同分不切）');
+  const basis=rateFallback?'全部模型价格缺失，按账号倍率：':'';
+  if(rateFallback && best.score===null)return reset('全部模型价格缺失，账号倍率也不可比较，保留当前');
+  if (current?.cost===null && usesPrice && !rateFallback) return reset('当前分组可用，模型价格暂不可比较');
+  if(rateFallback && current && current.score===null)return reset('全部模型价格缺失，当前账号倍率未知，保留当前');
+  if (current && current.score>=best.score-1e-9) return reset(rateFallback?'全部模型价格缺失，当前账号倍率最低（同倍率不切）':strategy.mode==='rate'?'当前账号倍率最低（同倍率不切）':'当前分组已是策略最优（同分不切）');
   if (!current) return {state:{...next,candidate:null,count:0,status:basis+'当前分组不合格，准备切换'},target:best.group.group_id};
   if(state.lastSwitchAt && now-state.lastSwitchAt<strategy.rules.cooldownMinutes*60000)return reset('切换冷却中');
   const improvement=rateFallback?(current.group.rate_multiplier-best.group.rate_multiplier)/Math.max(current.group.rate_multiplier,1e-12)*100:strategy.mode==='weighted'?best.score-current.score:['success','cacheHit'].includes(strategy.mode)?(best.metrics[strategy.mode]-current.metrics[strategy.mode])/Math.max(current.metrics[strategy.mode],1e-12)*100:(current.metrics[strategy.mode]-best.metrics[strategy.mode])/Math.max(current.metrics[strategy.mode],1e-12)*100;

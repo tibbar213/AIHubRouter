@@ -1,10 +1,10 @@
 import {chromium} from 'playwright-core';
-import {readFile,mkdir,mkdtemp} from 'node:fs/promises';
-import {resolve} from 'node:path';
+import {readFile,mkdtemp,rm} from 'node:fs/promises';
+import {dirname,join,resolve} from 'node:path';
+import {tmpdir} from 'node:os';
 import assert from 'node:assert/strict';
 const source=await readFile('userscript/AIHubRouter.user.js','utf8');
-await mkdir('work',{recursive:true});
-const profile=await mkdtemp(resolve('work/userscript-smoke-'));
+const profile=await mkdtemp(join(tmpdir(),'aihubrouter-userscript-smoke-'));
 const browser=await chromium.launchPersistentContext(profile,{executablePath:'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',headless:true,viewport:{width:1280,height:920}});
 let current=1,user=999,writes=0,lost=false,fail=false,missingPrice=false;
 const errors=[];
@@ -14,7 +14,7 @@ try{
     assert.equal(url.origin,'https://aihub.top');
     if(!path.startsWith('/api/'))return route.fulfill({contentType:'text/html',body:'<!doctype html><title>模拟 AIHub</title><h1>模拟平台页面</h1>'});
     const expires=new Date(Date.now()+90000).toISOString();
-    const group=id=>({group_id:id,code:'模拟渠道-'+id,platform:'openai',rate_multiplier:1,available:id!==1,probe_state:'enabled',probe_expires_at:expires,subscription_type:'standard',model_detection:{model:'实际检测模型',status:'passed'},group_models:[{model:'model-test'}],summary_models:{'model-test':{effective_input_price_per_million:id===1?1:.1}},model_cards:[{model:'model-test',health:'healthy',probe_state:'enabled',health_expires_at:expires}]});
+    const group=id=>({group_id:id,code:'模拟渠道-'+id,platform:'openai',rate_multiplier:1,available:id!==1,probe_state:'enabled',probe_expires_at:expires,subscription_type:'standard',model_detection:{model:'实际检测模型',status:'passed'},group_models:[{model:'model-test',price:{input_per_million:id===1?1:.1,output_per_million:id===1?1:.1}}],model_cards:[{model:'model-test',health:'healthy',probe_state:'enabled',health_expires_at:expires}]});
     let data;
     if(path==='/api/v1/auth/me')data={id:user};
     else if(path==='/api/v1/keys')data={pages:1,items:[{id:7,name:'模拟 Key',key:'SECRET_NEVER_STORE',status:'active',group_id:current,max_rate_multiplier:0}]};
@@ -26,8 +26,7 @@ try{
         warnings:[{id:'high_error',status:'active',triggers:[{value:32.47,threshold:20,operator:'>=',window:'7d',complete:false,available:true}]}]
       }};
       if(missingPrice){
-        ranked.group_models[0].price={input_per_million:2,output_per_million:8,cache_input_per_million:0};
-        ranked.summary_models['model-test'].effective_input_price_per_million=null;
+        ranked.group_models[0].price={input_per_million:2,cache_input_per_million:0};
       }
       data={stale:false,generated_at:new Date().toISOString(),items:[group(1),ranked]};
     }
@@ -61,7 +60,9 @@ try{
   await a.getByRole('button',{name:'配置',exact:true}).click();
   await a.getByRole('button',{name:'读取 key 与模型',exact:true}).click();
   await a.locator('#keyId').selectOption('7');
-  await a.locator('#model').selectOption(JSON.stringify({platform:'openai',model:'model-test'}));
+  await a.locator('#model').selectOption(JSON.stringify({model:'model-test'}));
+  assert.equal(await a.locator('#model option:checked').textContent(),'model-test');
+  assert.equal(await a.locator('#appVersion').textContent(),source.match(/^\/\/ @version\s+(.+)$/m)[1]);
   await a.getByRole('button',{name:'保存 key 配置',exact:true}).click();
   await a.getByText('已完成',{exact:true}).waitFor();
   await a.getByRole('button',{name:'调整策略',exact:true}).click();
@@ -89,7 +90,7 @@ try{
   await a.getByRole('button',{name:'立即检查',exact:true}).click();
   await a.getByText('合格候选 · 1 个',{exact:true}).waitFor();
   const unavailable=a.locator('.candidate-details tbody');
-  await unavailable.getByText('指定模型真实价格缺失或未就绪',{exact:true}).waitFor();
+  await unavailable.getByText('指定模型标价缺失或无效',{exact:true}).waitFor();
   await unavailable.getByText('输入 $2.00',{exact:true}).waitFor();
   await unavailable.getByText('缓存输入 $0.00',{exact:true}).waitFor();
   await unavailable.getByText('8 / 214 · 24h',{exact:true}).waitFor();
@@ -110,17 +111,26 @@ try{
   await send(b,{type:'check'});assert.equal(writes,2);assert.equal((await state()).states[7].pending,null);
   current=1;await send(a,{type:'check'});fail=true;await send(a,{type:'check'});await send(b,{type:'check'});
   assert.equal((await state()).configs[0].paused,true);assert.equal(writes,3);
-  const configured=await send(a,{type:'configure',keyId:7,platform:'openai',model:'model-test',automatic:true});assert.equal(configured.error,undefined);
+  const configured=await send(a,{type:'configure',keyId:7,model:'model-test',automatic:true});assert.equal(configured.error,undefined);
   user=123;await send(b,{type:'check'});assert.equal((await state()).accountMismatch,true);assert.equal(writes,3);
   const stored=await a.evaluate(()=>localStorage.getItem('TEST_GM:aihubrouter:app:v1'));
   assert.ok(!stored.includes('SECRET_NEVER_STORE'));assert.ok(!stored.includes('FAKE_SESSION'));
-  await send(a,{type:'disconnect'});await b.reload();await b.evaluate(script);
+  await a.getByRole('button',{name:'配置',exact:true}).click();
+  await a.locator('#disconnect').click();
+  const disconnectDialog=a.locator('dialog[open]');
+  const cancelDisconnect=disconnectDialog.getByRole('button',{name:'取消',exact:true});
+  assert.equal(await cancelDisconnect.evaluate(button=>button.matches(':focus')),true);
+  await cancelDisconnect.click();
+  assert.equal(await a.evaluate(()=>localStorage.getItem('TEST_GM:aihubrouter:disconnected:v1')),'false');
+  await a.locator('#disconnect').click();
+  await disconnectDialog.getByRole('button',{name:'确认断开',exact:true}).click();
+  await a.getByText('已完成',{exact:true}).waitFor();
+  await b.reload();await b.evaluate(script);
   assert.equal((await send(b,{type:'state'})).result.connected,false);
-  await mkdir('outputs',{recursive:true});
-  await a.screenshot({path:'outputs/userscript-desktop.png'});
+  await a.screenshot({path:join(profile,'userscript-desktop.png')});
   await a.setViewportSize({width:390,height:844});
   assert.equal(await a.locator('.panel').evaluate(e=>e.scrollWidth<=e.clientWidth),true);
-  await a.screenshot({path:'outputs/userscript-mobile.png'});
+  await a.screenshot({path:join(profile,'userscript-mobile.png')});
   // The host reset must not override the shadow theme's inherited text color.
   for(const colorScheme of ['dark','light']){
     await a.emulateMedia({colorScheme});
@@ -133,13 +143,13 @@ try{
   }
   await a.emulateMedia({colorScheme:'dark'});
   await a.waitForTimeout(250); // Let existing button theme transitions finish before the screenshot.
-  await a.screenshot({path:'outputs/userscript-mobile-dark.png'});
+  await a.screenshot({path:join(profile,'userscript-mobile-dark.png')});
   // Two new tabs start their schedulers together with an overdue automatic key.
   await a.close();await b.close();current=1;user=999;lost=false;fail=false;
   const seed=await browser.newPage();await seed.goto('https://aihub.top/providers');
   await seed.evaluate(()=>{
     GM_setValue('aihubrouter:disconnected:v1',false);
-    GM_setValue('aihubrouter:app:v1',JSON.stringify({schemaVersion:7,account:999,checkMinutes:5,configs:[{keyId:7,platform:'openai',model:'model-test',automatic:true,paused:false}],states:{7:{expectedGroupId:1}},logs:[],notices:{},defaultStrategy:{mode:'price'}}));
+    GM_setValue('aihubrouter:app:v1',JSON.stringify({schemaVersion:7,account:999,checkMinutes:5,configs:[{keyId:7,model:'model-test',automatic:true,paused:false}],states:{7:{expectedGroupId:1}},logs:[],notices:{},defaultStrategy:{mode:'price'}}));
   });
   const scheduled=await Promise.all([page(),page()]);
   await scheduled[0].waitForFunction(()=>{
@@ -151,4 +161,8 @@ try{
   assert.ok(Date.now()-attempt<60000);
   assert.deepEqual(errors,[]);
   console.log('Userscript offline smoke passed: UI binding, preview, two-tab serialization, unknown writes, no replay, account guard, persistent disconnect, narrow layout, credential minimization.');
-}finally{await browser.close();}
+}finally{
+  await browser.close();
+  if(dirname(resolve(profile))!==resolve(tmpdir()))throw new Error('Unexpected smoke-test profile path');
+  await rm(profile,{recursive:true,force:true,maxRetries:3});
+}

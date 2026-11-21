@@ -1,24 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {platformPrice,migrateApp,assess,decide,reconcilePending,INTERVAL,PLATFORMS,validateStrategy,DEFAULT_STRATEGY,providerBadgeDetails} from '../extension/core.js';
+import {platformPrice,migrateApp,assess,decide,reconcilePending,INTERVAL,validateStrategy,DEFAULT_STRATEGY,providerBadgeDetails} from '../extension/core.js';
 const now=Date.parse('2026-10-30T05:00:00Z');
-const config={keyId:1,platform:'openai',model:'test-model'};
-function group(id,cost=1,platform='openai'){return {group_id:id,code:`G${id}`,platform,rate_multiplier:1,bindable:true,available:true,probe_state:'enabled',probe_expires_at:new Date(now+INTERVAL*10).toISOString(),subscription_type:'standard',model_detection:{model:'test-model',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'test-model'}],summary_models:{'test-model':{effective_input_price_per_million:cost,effective_multiplier:.1,effective_multiplier_ready:true,range_cache:{ready:true,stale:false}}},model_cards:[{model:'test-model',probe_state:'enabled',health:'healthy',health_expires_at:new Date(now+INTERVAL*10).toISOString()}]};}
+const config={keyId:1,model:'test-model'};
+function group(id,cost=1,platform='openai'){return {group_id:id,code:`G${id}`,platform,rate_multiplier:1,bindable:true,available:true,probe_state:'enabled',probe_expires_at:new Date(now+INTERVAL*10).toISOString(),subscription_type:'standard',model_detection:{model:'test-model',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'test-model',price:{input_per_million:cost,output_per_million:cost}}],summary_models:{'test-model':{range_cache:{ready:true,stale:false}}},model_cards:[{model:'test-model',probe_state:'enabled',health:'healthy',health_expires_at:new Date(now+INTERVAL*10).toISOString()}]};}
 function snapshot(items,time=now){return {items,stale:false,generated_at:new Date(time).toISOString()};}
 function run(items,state={},time=now,extra={}){return decide({config,state,currentGroupId:1,snapshot:snapshot(items,time),now:time,globalStrategy:{mode:'price',rules:{confirmRounds:2}},...extra});}
-test('Gemini models are eligible using the same model-specific rules',()=>{
-  const candidate=group(2,.2,'gemini');
-  assert.ok(PLATFORMS.includes('gemini'));
-  assert.equal(assess(candidate,{...config,platform:'gemini'},snapshot([candidate]),now).cost,.2);
+test('matches by bound model across platforms despite a legacy platform field',()=>{
+  const current=group(1,1),other=group(2,.2,'gemini'),unlisted=group(3,.01);
+  unlisted.group_models[0].model='another-model';
+  const result=run([current,other,unlisted],{},now,{config:{...config,platform:'openai'}});
+  assert.deepEqual(result.state.choices.map(choice=>choice.id),[2,1]);
+  assert.equal(result.state.candidate,2);
 });
-test('uses selected-model real price verbatim, never raw rates or group aggregate',()=>{
-  const g=group(1,.27);g.rate_multiplier=.0001;g.effective_input_price_per_million=.001;
-  assert.deepEqual(platformPrice(g,'test-model'),{cost:.27,predictedMultiplier:.1});
-  assert.equal(platformPrice(g,'different-model'),null);
+test('model price weights input and output 3:1 and applies the account multiplier',()=>{
+  const g=group(1);g.rate_multiplier=.5;g.public_rate_multiplier=10;
+  g.group_models[0].price={input_per_million:2,output_per_million:10,cache_input_per_million:100};
+  g.group_models.push({model:'another-model',price:{input_per_million:8,output_per_million:8}});
+  g.summary_models['test-model'].effective_input_price_per_million=99;
+  assert.deepEqual(platformPrice(g,'test-model',now),{cost:2,predictedMultiplier:null});
+  assert.equal(platformPrice(g,'another-model',now).cost,4);
+  assert.equal(platformPrice(g,'different-model',now),null);
+  assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:1.99}}}).state.excluded['模型价格超过上限'],1);
+  assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:2}}}).state.choices[0].cost,2);
+  g.rate_multiplier=NaN;
+  assert.equal(assess(g,config,snapshot([g]),now).priceReason,'账号倍率无效，无法计算模型价格');
 });
-test('real price sorts ahead of conflicting predicted multiplier and raw rate',()=>{
-  const a=group(1,.5),b=group(2,.2);a.rate_multiplier=.01;b.rate_multiplier=10;
-  a.summary_models['test-model'].effective_multiplier=.01;b.summary_models['test-model'].effective_multiplier=2;
+test('model cost can favor a higher rate when its list price is lower',()=>{
+  const a=group(1,5),b=group(2,.2);a.rate_multiplier=.5;b.rate_multiplier=2;
   assert.equal(run([a,b]).state.candidate,2);
 });
 test('Hall spending rank and warnings are display data and leave routing unchanged',()=>{
@@ -46,7 +55,7 @@ test('Hall spending rank and warnings are display data and leave routing unchang
 });
 test('zero is a valid platform price; invalid or absent values do not fall back',()=>{
   assert.equal(platformPrice(group(1,0),'test-model').cost,0);
-  for(const v of [null,undefined,NaN,Infinity,-1,'0.1']){const g=group(1);g.summary_models['test-model'].effective_input_price_per_million=v;assert.equal(platformPrice(g,'test-model'),null);}
+  for(const v of [null,undefined,NaN,Infinity,-1,'0.1']){const g=group(1);g.group_models[0].price.output_per_million=v;assert.equal(platformPrice(g,'test-model'),null);}
 });
 test('optional Hall warning filter rejects active warnings and ignores expired or partial-only data',()=>{
   const warned=group(2,.1),expires=new Date(now+60000).toISOString();
@@ -69,9 +78,7 @@ test('optional Hall warning filter rejects active warnings and ignores expired o
 });
 test('an explicit price cap excludes missing prices until they can be checked',()=>{
   const blocked=group(1,.3),unhealthy=group(2,.1);
-  const summary=blocked.summary_models['test-model'];
-  summary.effective_input_price_per_million=null;
-  blocked.group_models[0].price={input_per_million:2,output_per_million:8,cache_input_per_million:0};
+  blocked.group_models[0].price={input_per_million:2,cache_input_per_million:0};
   blocked.badges={warnings:[]};
   blocked.badges_expires_at=new Date(now+60000).toISOString();
   unhealthy.model_cards[0].health='unhealthy';
@@ -81,10 +88,10 @@ test('an explicit price cap excludes missing prices until they can be checked',(
   assert.deepEqual(first.state.choices,[]);
   assert.deepEqual(first.state.priceUnavailableChoices,[{
     id:1,code:'G1',hall:{badges:blocked.badges,expiresAt:blocked.badges_expires_at},
-    reason:'指定模型真实价格缺失或未就绪',channelPrice:blocked.group_models[0].price
+    reason:'指定模型标价缺失或无效',channelPrice:blocked.group_models[0].price
   }]);
-  assert.equal(first.state.excluded['指定模型真实价格缺失或未就绪'],1);
-  summary.effective_input_price_per_million=.3;
+  assert.equal(first.state.excluded['指定模型标价缺失或无效'],1);
+  blocked.group_models[0].price={input_per_million:.2,output_per_million:.6};
   const recovered=run([blocked,unhealthy],first.state,now,capped);
   assert.deepEqual(recovered.state.choices.map(choice=>choice.id),[1]);
   assert.deepEqual(recovered.state.priceUnavailableChoices,[]);
@@ -95,7 +102,7 @@ test('a usable unpriced current group stays eligible and is kept alongside price
   const result=run([current,priced]);
   assert.equal(result.target,null);
   assert.equal(result.notice,undefined);
-  assert.equal(result.state.status,'当前分组可用，真实价格暂不可比较');
+  assert.equal(result.state.status,'当前分组可用，模型价格暂不可比较');
   assert.deepEqual(result.state.choices.map(choice=>choice.id),[2,1]);
   assert.equal(result.state.choices[1].score,null);
   assert.equal(result.state.choices[1].cost,null);
@@ -111,7 +118,7 @@ test('price-based strategies can recover to eligible channels when no prices are
   const weighted={globalStrategy:{mode:'weighted',weights:{price:80,latency:20,success:0}}};
   const byWeighted=run(items,{},now,weighted);
   assert.equal(byWeighted.target,3);
-  slower.summary_models['test-model'].effective_input_price_per_million=.4;
+  slower.group_models[0].price={input_per_million:.4,output_per_million:.4};
   assert.equal(run(items,{},now,weighted).target,2);
 });
 
@@ -135,7 +142,7 @@ test('all unpriced channels use account rates with confirmation, ties and improv
   assert.equal(run(items,{lastSwitchAt:now},now,{globalStrategy:{mode:'price',rules:{cooldownMinutes:1}}}).target,null);
 });
 
-test('explicit rate mode uses account rates regardless of real prices and retains equal rates',()=>{
+test('explicit rate mode uses account rates regardless of model prices and retains equal rates',()=>{
   const current=group(1,.01),other=group(2,10);
   current.rate_multiplier=.2;other.rate_multiplier=.12;
   current.public_rate_multiplier=.01;other.public_rate_multiplier=10;
@@ -144,7 +151,7 @@ test('explicit rate mode uses account rates regardless of real prices and retain
   assert.equal(first.state.candidate,2);assert.equal(first.target,null);
   assert.equal(first.state.rankingBasis,'rate');
   assert.equal(run([current,other],first.state,now+INTERVAL,extra).target,2);
-  other.summary_models['test-model'].effective_input_price_per_million=null;
+  delete other.group_models[0].price;
   assert.equal(run([current,other],{},now,{globalStrategy:{mode:'rate'}}).target,2);
   assert.equal(run([current,other],{},now,{globalStrategy:{mode:'rate',rules:{minImprovement:41}}}).target,null);
   assert.equal(run([current,other],{lastSwitchAt:now},now,{globalStrategy:{mode:'rate',rules:{cooldownMinutes:1}}}).target,null);
@@ -170,81 +177,10 @@ test('rate fallback never invents rates or bypasses price caps and resets when p
   current.available=true;other.rate_multiplier=.1;
   assert.deepEqual(run([current,other],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:1}}}).state.choices,[]);
   const first=run([current,other]);
-  current.summary_models['test-model'].effective_input_price_per_million=.5;
-  other.summary_models['test-model'].effective_input_price_per_million=.1;
+  current.group_models[0].price={input_per_million:.5,output_per_million:.5};
+  other.group_models[0].price={input_per_million:.1,output_per_million:.1};
   const priced=run([current,other],first.state,now+INTERVAL);
   assert.equal(priced.state.rankingBasis,'price');assert.equal(priced.state.count,1);assert.equal(priced.target,null);
-});
-test('missing or unready prediction hides companion value without blocking real price',()=>{
-  const g=group(1,.2);g.summary_models['test-model'].effective_multiplier_ready=false;
-  assert.deepEqual(platformPrice(g,'test-model'),{cost:.2,predictedMultiplier:null});
-});
-test('price cache explicitly stale or not ready is excluded',()=>{
-  for(const cache of [{stale:true,ready:true},{stale:false,ready:false}]){
-    const g=group(1);g.summary_models['test-model'].range_cache=cache;
-    assert.equal(platformPrice(g,'test-model'),null);
-  }
-});
-test('sample-limited grok price estimate participates in selection and uses the verified public rate',()=>{
-  const g=group(2,1,'grok');g.rate_multiplier=.13;g.public_rate_multiplier=.13;g.group_models[0].model='grok-4.7';g.model_cards[0].model='grok-4.7';g.model_detection.model='grok-4.7';
-  g.summary_models={'grok-4.7':{effective_input_price_per_million:null,effective_multiplier_reason:'insufficient_samples',range_cache:{ready:true,coverage_complete:true,stale:false,refreshed_at:new Date(now).toISOString(),pricing_models:{'grok-4.7':{usage_records:71,sol_equivalent_unit_price:.6847290640394089,unknown_context_records:0,long_input_tokens:0,long_cache_read_tokens:0,long_cache_creation_tokens:0}}}}};
-  const c={...config,platform:'grok',model:'grok-4.7'},result=decide({config:c,currentGroupId:1,snapshot:snapshot([g]),now});
-  assert.ok(Math.abs(result.state.choices[0].cost-.08901477832512317)<1e-14);assert.equal(result.state.choices[0].estimated,true);assert.equal(result.state.choices[0].priceSamples,71);assert.equal(result.target,2);
-  for(const [platform,model] of [['gemini','gemini-4-argon'],['kimi','future-model'],['new-provider','new-model']]){const other=structuredClone(g),summary=other.summary_models['grok-4.7'];other.platform=platform;other.group_models[0].model=model;other.model_cards[0].model=model;other.model_detection.model=model;summary.range_cache.pricing_models[model]=summary.range_cache.pricing_models['grok-4.7'];other.summary_models={[model]:summary};const estimate=assess(other,{...config,platform,model},snapshot([other]),now);assert.equal(estimate.estimated,true);assert.ok(Math.abs(estimate.cost-.08901477832512317)<1e-14);}
-  for(const change of [x=>x.rate_multiplier=.2,x=>x.summary_models['grok-4.7'].range_cache.stale=true,x=>x.summary_models['grok-4.7'].range_cache.coverage_complete=false,x=>x.summary_models['grok-4.7'].range_cache.pricing_models['grok-4.7'].unknown_context_records=1,x=>x.summary_models['grok-4.7'].range_cache.refreshed_at=new Date(now-INTERVAL-1).toISOString()]){const altered=structuredClone(g);change(altered);assert.equal(platformPrice(altered,'grok-4.7',now),null);}
-  const accountRateDiffers=structuredClone(g);
-  accountRateDiffers.rate_multiplier=.2;
-  const noSamples=structuredClone(g);
-  noSamples.summary_models[c.model].effective_multiplier_reason='no_qualifying_requests';
-  noSamples.summary_models[c.model].range_cache.ready=false;
-  assert.equal(assess(accountRateDiffers,c,snapshot([accountRateDiffers]),now).priceReason,'账号倍率与公开倍率不同，无法估算价格');
-  assert.equal(assess(noSamples,c,snapshot([noSamples]),now).priceReason,'指定模型没有可计价样本');
-});
-
-function cachePricedGroup(id,hit,rate){
-  const g=group(id,null),read=Math.round(hit*1000),input=1000-read;
-  g.rate_multiplier=rate;g.public_rate_multiplier=.045;
-  g.group_models[0].price={input_per_million:1,cache_input_per_million:.02};
-  g.summary_models[config.model].range_cache={ready:true,coverage_complete:true,stale:false,usage_records:10,refreshed_at:new Date(now).toISOString(),cache_hit_rate:hit,
-    pricing_models:{[config.model]:{usage_records:10,input_tokens:input,cache_read_tokens:read,cache_creation_tokens:0,baseline_input_per_million:5,sol_equivalent_unit_price:(5*input+.5*read)/1000,unknown_context_records:0,long_input_tokens:0,long_cache_read_tokens:0,long_cache_creation_tokens:0}}};
-  return g;
-}
-
-test('missing prices use cache rate and account rate in the platform equivalent-price unit',()=>{
-  const current=cachePricedGroup(1,.8,.12),other=cachePricedGroup(2,.95,.2);
-  const result=run([current,other],{},now,{globalStrategy:{mode:'price'}});
-  assert.equal(result.target,2);
-  assert.deepEqual(result.state.choices.map(x=>x.id),[2,1]);
-  assert.ok(Math.abs(result.state.choices[0].cost-.145)<1e-12);
-  assert.ok(Math.abs(result.state.choices[1].cost-.168)<1e-12);
-  assert.equal(result.state.choices[0].estimateKind,'cache-rate');
-  assert.equal(result.state.choices[0].estimated,true);
-  assert.deepEqual(result.state.choices[0].estimateBasis,{inputPrice:5,cacheInputPrice:.5,cacheHit:.95,accountMultiplier:.2});
-  current.summary_models[config.model].effective_input_price_per_million=.14;
-  const mixed=run([current,other],{},now,{globalStrategy:{mode:'price'}});
-  assert.equal(mixed.target,null);assert.equal(mixed.state.choices[0].estimated,false);
-  assert.equal(mixed.state.choices[0].cost,.14);
-  current.summary_models[config.model].effective_input_price_per_million=0;
-  assert.equal(platformPrice(current,config.model,now).cost,0);
-  current.summary_models[config.model].effective_input_price_per_million=null;
-  const capped=run([current,other],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:.15,minCacheHit:90}}});
-  assert.deepEqual(capped.state.choices.map(x=>x.id),[2]);assert.equal(capped.state.excluded['缓存率低于下限'],1);
-  other.rate_multiplier=0;assert.equal(platformPrice(other,config.model,now).cost,0);
-});
-
-test('cache-price estimates require fresh model data and a valid comparable pricing basis',()=>{
-  for(const change of [g=>g.rate_multiplier=undefined,g=>g.summary_models[config.model].range_cache.stale=true,g=>g.summary_models[config.model].range_cache.refreshed_at=new Date(now-INTERVAL-1).toISOString(),g=>delete g.summary_models[config.model].range_cache.pricing_models,
-    g=>g.summary_models[config.model].range_cache.pricing_models[config.model].cache_creation_tokens=1,g=>g.summary_models[config.model].range_cache.pricing_models[config.model].long_input_tokens=1,
-    g=>g.summary_models[config.model].range_cache.pricing_models[config.model].baseline_input_per_million=null]){
-    const g=cachePricedGroup(2,.8,.12);change(g);assert.equal(platformPrice(g,config.model,now),null);
-  }
-  for(const hit of [0,1]){
-    const g=cachePricedGroup(2,hit,.12),price=platformPrice(g,config.model,now);
-    assert.ok(Math.abs(price.cost-(hit===0?.6:.06))<1e-12);
-  }
-  const current=cachePricedGroup(1,.8,.12),other=cachePricedGroup(2,.95,.2);
-  const first=run([current,other]);assert.equal(first.target,null);
-  assert.equal(run([current,other],first.state,now+INTERVAL).target,2);
 });
 test('migration removes old formula settings, resets observations and preserves pending writes and opt-in',()=>{
   const app={configs:[{keyId:1,profile:{ratio:15},automatic:true,paused:true}],pricing:{verified:true},states:{1:{expectedGroupId:3,pending:{from:3,to:4},candidate:4,count:2,choices:[{cost:99}]} }};
@@ -340,13 +276,9 @@ test('authenticated Hall fields do not veto a fresh card for a bindable group',(
   assert.match(check({bindable:undefined}).reason,/账号不可绑定/);
   assert.match(check({model_detection:{status:'detection_failed'}}).reason,/检测未通过/);
 });
-test('platform price remains usable with special billing flags and no token prices',()=>{
+test('valid model list prices are used with special billing flags',()=>{
   const g={...group(1),long_context_pricing_enabled:true,peak_rate_enabled:true};
-  g.group_models[0].price=undefined;
   assert.equal(assess(g,config,snapshot([g]),now).cost,1);
-});
-test('each platform and key chooses only its bound model',()=>{
-  for(const platform of PLATFORMS){const a=run([group(1,1,platform),group(2,.5,platform),group(3,.01,'other')],{},now,{config:{...config,platform}});assert.equal(a.state.candidate,2);}
 });
 test('pending readback pauses if unchanged and accepts a third group without retrying',()=>{
   const s={pending:{from:1,to:2}};
@@ -358,7 +290,7 @@ test('pending readback pauses if unchanged and accepts a third group without ret
 function measured(id,price,latency,success){
   const g=group(id,price);Object.assign(g.summary_models['test-model'],{user_latency_ms:latency,success_rate:success,sample_count:100});return g;
 }
-test('global latency strategy picks fastest even if real price is missing',()=>{
+test('global latency strategy picks fastest even if model price is missing',()=>{
   const gs=[measured(1,1,3000,.99),measured(2,null,500,.9)];
   const a=run(gs,{},now,{globalStrategy:{mode:'latency'}});
   assert.equal(a.state.candidate,2);assert.equal(a.state.choices[0].cost,null);
