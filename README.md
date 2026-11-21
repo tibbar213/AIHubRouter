@@ -14,7 +14,7 @@
 
 <p align="center">Chrome / Edge · Manifest V3 · MIT 开源 · 配置保存在本地</p>
 
-![AIHubRouter 监控总览：运行状态、当前渠道价格及合格候选对比](docs/images/monitor.png)
+![AIHubRouter 监控总览：每个 key 一张卡片，右侧选择模型并显示最低价，下方是当前渠道价格与合格候选对比](docs/images/monitor.png)
 
 > 界面截图来自插件的隔离测试环境，使用模拟 key、渠道与报价，仅用于展示功能。
 
