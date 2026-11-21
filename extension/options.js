@@ -1,7 +1,7 @@
 import {validateStrategy,strategyLabel,providerBadgeDetails} from './core.js';
 const $=id=>document.getElementById(id);
 let catalog={keys:[],models:[]},app,globalLoaded=false;
-let appliedCatalogAt=0;
+let appliedCatalogAt=0,connected=false;
 const version=chrome.runtime.getManifest().version;
 if(version)$('appVersion').textContent=version;
 const defaultEditor=$('defaultStrategyForm');
@@ -12,11 +12,6 @@ function showView(view){
 }
 for(const button of document.querySelectorAll('[data-view]'))button.onclick=()=>showView(button.dataset.view);
 document.querySelector('.brand').onclick=e=>{e.preventDefault();showView('monitors');};
-function addMonitor(){
-  $('keyId').value='';$('model').value='';$('automatic').checked=false;
-  showView('settings');$('configForm').scrollIntoView({behavior:'smooth',block:'center'});
-}
-$('addKey').onclick=addMonitor;
 $('connection').onclick=()=>showView('settings');
 const viewSort=new Map();
 const expandedCandidates=new Set();
@@ -78,6 +73,7 @@ const warningLabels={
 };
 const badgeNumber=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:2});
 const channelPriceNumber=new Intl.NumberFormat('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:8,useGrouping:false});
+const minPriceNumber=new Intl.NumberFormat('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:6,useGrouping:false});
 const channelPriceFields=[['input_per_million','输入'],['output_per_million','输出'],['cache_input_per_million','缓存输入'],['cache_write_per_million','缓存写入']];
 function candidateBadgeCells(choice,now){
   const details=providerBadgeDetails(choice.hall,now),rank=details?.popularity;
@@ -189,14 +185,24 @@ function candidateTable(config,state){
   }
   table.append(body);wrap.append(table);return wrap;
 }
-function fillCatalog(){
-  const selectedKey=$('keyId').value,selectedModel=$('model').value;
-  $('keyId').replaceChildren();option($('keyId'),'','选择已有 key');
-  for(const k of catalog.keys)option($('keyId'),String(k.id),`${k.name} · ID ${k.id} · 当前分组 ${k.groupId}`);
-  $('model').replaceChildren();option($('model'),'','选择此 key 固定使用的模型');
-  for(const model of new Set(catalog.models.map(m=>m.model)))option($('model'),JSON.stringify({model}),model);
-  if(selectedModel&&!Array.from($('model').options).some(x=>x.value===selectedModel))option($('model'),selectedModel,'此前选择的模型（本轮平台未列出）');
-  $('keyId').value=selectedKey;$('model').value=selectedModel;
+function modelSelect(keyId,config,pending){
+  const prices=new Map(catalog.models.map(m=>[m.model,m.minPrice]));
+  const models=[...prices.keys()];
+  const select=node('select',null,'model-select');select.setAttribute('aria-label',`Key ${keyId} 的模型`);
+  if(!config)option(select,'','未监控 · 选择模型');
+  for(const model of models){const min=prices.get(model);option(select,model,Number.isFinite(min)?`${model} · 最低 $${minPriceNumber.format(min)}/M`:`${model} · 价格未知`);}
+  if(config&&!models.includes(config.model))option(select,config.model,models.length?`${config.model}（本轮平台未列出）`:config.model);
+  select.value=config?.model??'';
+  select.disabled=!!pending;
+  select.onchange=()=>{if(select.value&&select.value!==config?.model)act(()=>send({type:'configure',keyId,model:select.value,automatic:config?.automatic===true}));};
+  return select;
+}
+function keyHeader(keyId,key,config,state){
+  const top=node('div',null,'monitor-top'),info=node('div',null,'monitor-name');
+  info.append(node('h3',key?.name??`Key ${keyId}`),node('span',`ID ${keyId}${key?` · 当前分组 ${key.groupId}`:''}`,'key-label'));
+  const badge=config?node('span',config.paused?'已暂停':config.automatic?'自动运行':'仅预览',`badge ${config.paused?'paused':config.automatic?'auto':'preview'}`):node('span','未监控','badge');
+  top.append(info,modelSelect(keyId,config,state?.pending),badge);
+  return top;
 }
 async function refresh(){
   const data=await send({type:'state'});app=data.app;
@@ -207,19 +213,20 @@ async function refresh(){
     globalLoaded=true;
   }
   for(const keyId of strategyEditors.keys())if(!app.configs.some(c=>c.keyId===keyId))strategyEditors.delete(keyId);
-  if(app.catalog && app.catalog.at!==appliedCatalogAt){catalog=app.catalog;fillCatalog();appliedCatalogAt=catalog.at;}
+  if(app.catalog && app.catalog.at!==appliedCatalogAt){catalog=app.catalog;appliedCatalogAt=catalog.at;}
+  connected=data.connected;
   $('connection').textContent=data.connected?'平台已连接':'等待连接';
   $('connection').classList.toggle('connected',data.connected);
   $('monitorCount').textContent=app.configs.length;
   $('overview').replaceChildren(...[['自动运行',app.configs.filter(c=>!c.paused&&c.automatic).length,'auto'],['仅预览',app.configs.filter(c=>!c.paused&&!c.automatic).length,'preview'],['已暂停',app.configs.filter(c=>c.paused).length,'paused']].map(([label,value,tone])=>{const stat=node('div',null,'stat '+tone);stat.append(node('strong',String(value)),node('span',label));return stat;}));
   $('lastCheck').textContent=`每 ${app.checkMinutes||5} 分钟检查 · ${app.lastCheck?'上次完成 '+new Date(app.lastCheck).toLocaleString():'尚未完成检查'} · 模型目录${catalog.at?'更新于 '+new Date(catalog.at).toLocaleTimeString():'尚未读取'}${app.lastError?' · '+app.lastError:''}`;
   $('monitors').replaceChildren();
-  if(!app.configs.length){const empty=node('div',null,'empty-state'),button=node('button','添加第一个监控');button.onclick=addMonitor;empty.append(node('strong','让每个模型找到合适的渠道'),node('p','还没有监控。先连接平台，再绑定 key 和模型。'),button);$('monitors').append(empty);}
+  const keyById=new Map(catalog.keys.map(k=>[k.id,k]));
+  if(!app.configs.length&&!catalog.keys.length){const empty=node('div',null,'empty-state'),button=node('button','读取 key');button.onclick=()=>$('refreshCatalog').click();empty.append(node('strong','让每个模型找到合适的渠道'),node('p','还没有监控。先连接平台，再绑定 key 和模型。'),button);$('monitors').append(empty);}
   for(const c of app.configs){
     const s=app.states[c.keyId]||{},box=node('article',null,'monitor');
     const groupText=s.observedGroupId!=null?`原记录分组 ${s.expectedGroupId??'未知'} · 最近读取分组 ${s.observedGroupId}`:`最近确认分组 ${s.expectedGroupId??'未知'}`;
-    const top=node('div',null,'monitor-top'),name=node('div',null,'monitor-name');name.append(node('h3',`${c.model} · Key ${c.keyId}`));top.append(name,node('span',c.paused?'已暂停':c.automatic?'自动运行':'仅预览',`badge ${c.paused?'paused':c.automatic?'auto':'preview'}`));
-    box.append(top,node('p',`${c.paused?'已暂停':c.automatic?'自动切换':'仅预览'} · ${s.status||'等待检查'}`,'monitor-status'),node('p',`${groupText} · ${strategyLabel(c.strategy)}`,'monitor-meta'));
+    box.append(keyHeader(c.keyId,keyById.get(c.keyId),c,s),node('p',`${c.paused?'已暂停':c.automatic?'自动切换':'仅预览'} · ${s.status||'等待检查'}`,'monitor-status'),node('p',`${groupText} · ${strategyLabel(c.strategy)}`,'monitor-meta'));
     const current=s.choices?.find(x=>x.id===s.expectedGroupId);
     if(current){const summary=node('div',null,'current-summary'),price=node('span',current.cost==null?'模型价格未知':'$'+current.cost.toFixed(6),'price');if(current.cost!=null)price.append(node('small',' /M'));summary.append(node('span','当前渠道','eyebrow'),node('span',current.code,'channel'),price);box.append(summary);}
     if(Array.isArray(s.choices)){const details=node('details',null,'candidate-details');details.open=expandedCandidates.has(c.keyId);details.addEventListener('toggle',()=>{if(details.open)expandedCandidates.add(c.keyId);else expandedCandidates.delete(c.keyId);});details.append(node('summary',`合格候选 · ${s.choices.length} 个`));if(s.choices.length)details.append(candidateTable(c,s),node('p','显示排序不影响自动策略。手动切换会重新验证资格，并暂停此 key 的自动选择。','muted'));else details.append(node('p','当前没有符合筛选条件的渠道。展开下方“未参与比较”查看原因；下轮检查会重新评估。','muted'));box.append(details);}
@@ -255,17 +262,16 @@ async function refresh(){
       editor.elements.mode.focus();
     };
     actions.append(adjust);
-    const edit=node('button','编辑绑定','quiet');edit.addEventListener('click',()=>act(async()=>{
-      if(!catalog.keys.length){catalog=await send({type:'catalog'});fillCatalog();}
-      $('keyId').value=String(c.keyId);$('model').value=JSON.stringify({model:c.model});$('automatic').checked=c.automatic;
-      showView('settings');$('configForm').scrollIntoView({behavior:'smooth',block:'center'});$('message').textContent='已载入 Key 与绑定模型。';
-    }));actions.append(edit);
     const pauseResume=node('button',c.paused?'恢复':'暂停','quiet');
     pauseResume.onclick=()=>act(()=>send({type:c.paused?'resume':'pause',keyId:c.keyId}));
     actions.append(pauseResume);
     const remove=node('button','移除监控','quiet danger');remove.onclick=()=>confirmAction('确认移除监控',['Key '+c.keyId+' · '+c.model,'移除后将停止此 Key 的检查和自动改组。'],'确认移除',{type:'remove',keyId:c.keyId});actions.append(remove);footer.append(controls,actions);box.append(footer);
     const editor=strategyEditors.get(c.keyId);if(editor)box.append(editor);
     $('monitors').append(box);
+  }
+  for(const k of catalog.keys){
+    if(app.configs.some(c=>c.keyId===k.id))continue;
+    const box=node('article',null,'monitor idle');box.append(keyHeader(k.id,k,null,null));$('monitors').append(box);
   }
   $('logs').replaceChildren(...app.logs.map(l=>{const item=node('li'),time=node('time',new Date(l.at).toLocaleString());time.dateTime=new Date(l.at).toISOString();item.append(time,node('span',l.text));return item;}));
   if(!app.logs.length)$('logs').append(node('li','暂无记录。连接平台并添加监控后，检查与切换动态会显示在这里。'));
@@ -275,12 +281,10 @@ async function act(fn){
   $('message').textContent='正在处理…';$('message').dataset.tone='busy';const buttons=[...document.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);
   try{await fn();if($('message').textContent==='正在处理…')$('message').textContent='已完成';$('message').dataset.tone='success';await refresh();if($('message').textContent==='已完成')messageTimer=setTimeout(()=>{$('message').textContent='';},4500);}catch(e){$('message').textContent=e.message;$('message').dataset.tone='error';}finally{buttons.forEach(b=>b.disabled=false);}
 }
-$('catalog').onclick=()=>act(async()=>{catalog=await send({type:'catalog'});fillCatalog();});
+$('catalog').onclick=$('refreshCatalog').onclick=()=>act(async()=>{catalog=await send({type:'catalog'});appliedCatalogAt=catalog.at;});
 $('disconnect').onclick=()=>confirmAction('确认断开并暂停',['将断开平台连接并暂停全部监控。'],'确认断开',{type:'disconnect'});
 $('resetAccount').onclick=()=>confirmAction('确认清空账号绑定',['移除全部监控后，可清空保存的账号绑定并连接其他账号。'],'确认清空',{type:'resetAccount'});
 $('check').onclick=()=>act(()=>send({type:'check'}));
 defaultEditor.onsubmit=event=>{event.preventDefault();act(()=>send({type:'strategy',strategy:readEditor(defaultEditor,defaultEditor.elements.requireDetection.checked),checkMinutes:Number($('checkMinutes').value)}));};
-$('keyId').onchange=()=>{const c=app?.configs.find(c=>c.keyId===Number($('keyId').value));$('automatic').checked=c?.automatic===true;if(c)$('model').value=JSON.stringify({model:c.model});};
-$('configForm').onsubmit=event=>{event.preventDefault();act(async()=>{const m=JSON.parse($('model').value);await send({type:'configure',keyId:Number($('keyId').value),...m,automatic:$('automatic').checked});showView('monitors');});};
-refresh().catch(e=>$('message').textContent=e.message);
+refresh().then(()=>{if(connected&&!catalog.keys.length)$('refreshCatalog').click();}).catch(e=>$('message').textContent=e.message);
 setInterval(()=>{if(!document.querySelector('dialog[open]')&&!document.activeElement?.matches('input,select'))refresh().catch(()=>{});},20000);

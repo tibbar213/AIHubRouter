@@ -72,13 +72,13 @@ try{
   });
   await page.getByRole('button',{name:'配置',exact:true}).click();
   await page.getByRole('button',{name:'读取 key 与模型',exact:true}).click();
-  await page.locator('#keyId option[value="101"]').waitFor({state:'attached'});
-  await page.locator('#keyId').selectOption('101');
-  await page.locator('#model').selectOption({label:'gpt-example'});
-  assert.equal(await page.locator('#model').inputValue(),JSON.stringify({model:'gpt-example'}));
+  await page.locator('[data-view=monitors]').click();
+  const keyModel=page.getByLabel('Key 101 的模型',{exact:true});
+  await keyModel.waitFor();
+  assert.equal(await keyModel.inputValue(),'');
   assert.equal(await page.locator('#appVersion').textContent(),await worker.evaluate(()=>chrome.runtime.getManifest().version));
-  await page.getByRole('button',{name:'保存 key 配置',exact:true}).click();
-  try { await page.getByRole('heading',{name:'gpt-example · Key 101',exact:true}).waitFor({timeout:5000}); } catch(e) { console.log('UI status:', await page.locator('#message').innerText()); console.log('Page errors:', errors); throw e; }
+  await keyModel.selectOption('gpt-example');
+  try { await page.locator('.monitor:not(.idle)').getByRole('heading',{name:'测试用 key',exact:true}).waitFor({timeout:5000}); } catch(e) { console.log('UI status:', await page.locator('#message').innerText()); console.log('Page errors:', errors); throw e; }
   await page.getByRole('button',{name:'调整策略',exact:true}).click();
   const editor=page.getByRole('form',{name:'Key 101 的策略'});
   assert.equal(await editor.locator('[name=mode]').inputValue(),'weighted');
@@ -125,7 +125,7 @@ try{
   await page.screenshot({path:join(profile,'monitor-narrow.png'),fullPage:true});
   await page.emulateMedia({colorScheme:'dark'});
   await page.screenshot({path:join(profile,'monitor-dark.png'),fullPage:true,animations:'disabled'});
-  assert.equal(await page.locator('#addKey').evaluate(e=>getComputedStyle(e).backgroundColor),'rgb(21, 27, 36)');
+  assert.equal(await page.locator('#refreshCatalog').evaluate(e=>getComputedStyle(e).backgroundColor),'rgb(21, 27, 36)');
   await page.emulateMedia({colorScheme:'light'});
   await page.getByRole('button',{name:'配置',exact:true}).click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
@@ -184,7 +184,8 @@ try{
   }
   const storedApp=()=>worker.evaluate(async()=>(await chrome.storage.local.get('app')).app);
   await confirmDestructive(page.getByRole('button',{name:'移除监控',exact:true}),'确认移除',async()=>assert.equal((await storedApp()).configs.length,1));
-  await page.getByText('还没有监控。先连接平台，再绑定 key 和模型。').waitFor();
+  await page.locator('.monitor.idle').getByText('未监控',{exact:true}).waitFor();
+  assert.equal(await page.getByLabel('Key 101 的模型',{exact:true}).inputValue(),'');
   await page.getByRole('button',{name:'配置',exact:true}).click();
   const storedAuth=()=>worker.evaluate(async()=>(await chrome.storage.session.get('auth')).auth);
   await confirmDestructive(page.locator('#disconnect'),'确认断开',async()=>assert.ok(await storedAuth()));

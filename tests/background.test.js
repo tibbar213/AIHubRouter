@@ -145,7 +145,8 @@ test('resume blocks unresolved switches and a different platform account',async(
 });
 test('catalog deduplicates the model across platforms and configure stores the model alone',async()=>{
   const b=await boot();const catalog=await b.send({type:'catalog'});
-  assert.deepEqual(catalog.result.models,[{model:'model-test'}]);
+  assert.deepEqual(catalog.result.models.map(m=>m.model),['model-test']);
+  assert.ok(catalog.result.models[0].minPrice===null||Number.isFinite(catalog.result.models[0].minPrice));
   await b.send({type:'remove',keyId:7});
   const result=await b.send({type:'configure',keyId:7,model:'model-test',automatic:false});
   assert.equal(result.error,undefined);

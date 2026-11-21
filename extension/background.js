@@ -1,4 +1,4 @@
-import {decide,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,DEFAULT_STRATEGY,INTERVAL} from './core.js';
+import {decide,platformPrice,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,DEFAULT_STRATEGY,INTERVAL} from './core.js';
 const ORIGIN='https://aihub.top', ALARM='aihub-check';
 const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:8,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
 let queue=Promise.resolve();
@@ -86,7 +86,11 @@ async function authorizedSnapshot(){
   return snapshot;
 }
 function catalogData(all,snapshot){
-  const models=[...new Set(snapshot.items.flatMap(g=>(g.group_models||[]).map(m=>m.model).filter(model=>typeof model==='string' && model.length>0 && model.length<=200)))].sort((a,b)=>a.localeCompare(b)).map(model=>({model}));
+  const models=[...new Set(snapshot.items.flatMap(g=>(g.group_models||[]).map(m=>m.model).filter(model=>typeof model==='string' && model.length>0 && model.length<=200)))].sort((a,b)=>a.localeCompare(b)).map(model=>{
+    // Lowest account-rate price among groups this account can bind; null when none is comparable.
+    const costs=snapshot.items.filter(g=>g.bindable!==false).map(g=>platformPrice(g,model)?.cost).filter(Number.isFinite);
+    return {model,minPrice:costs.length?Math.min(...costs):null};
+  });
   return {keys:all,models,at:Date.now()};
 }
 function errorText(e){return ({AUTH:'网站登录已失效，请打开平台并重新登录或刷新页面',NETWORK:'平台连接失败，将在下轮重试',FORBIDDEN:'平台拒绝请求，请检查登录状态或分组权限',FORMAT:'平台返回的数据无法识别，本轮未切换',STALE:'平台数据已过期或时间异常，本轮未切换，将在下轮重试',BUSINESS:'平台未确认操作成功，请检查后重试',HTTP:'平台服务异常，本轮停止',ACCOUNT:'当前账号与监控配置不一致',TAB_TIMEOUT:'读取已打开的 AIHub 页面超时，请刷新该页面后重试'})[e.message]||'检查未完成，本轮停止';}
@@ -205,7 +209,7 @@ async function handle(message,pauseRequest,disconnectRequest){
   }
   if(message.type==='catalog'){
     await connectedIdentity(app);
-    const [all,snapshot]=await Promise.all([keys(),providers()]);app.catalog=catalogData(all,snapshot);await save(app);
+    const [all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);app.catalog=catalogData(all,snapshot);await save(app);
     return app.catalog;
   }
   if(message.type==='configure'){

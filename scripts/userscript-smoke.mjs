@@ -59,11 +59,10 @@ try{
   await a.getByRole('button',{name:'↗ AIHubRouter',exact:true}).click();
   await a.getByRole('button',{name:'配置',exact:true}).click();
   await a.getByRole('button',{name:'读取 key 与模型',exact:true}).click();
-  await a.locator('#keyId').selectOption('7');
-  await a.locator('#model').selectOption(JSON.stringify({model:'model-test'}));
-  assert.equal(await a.locator('#model option:checked').textContent(),'model-test');
+  await a.getByText('已完成',{exact:true}).waitFor();
+  await a.locator('[data-view=monitors]').click();
+  await a.getByLabel('Key 7 的模型',{exact:true}).selectOption('model-test');
   assert.equal(await a.locator('#appVersion').textContent(),source.match(/^\/\/ @version\s+(.+)$/m)[1]);
-  await a.getByRole('button',{name:'保存 key 配置',exact:true}).click();
   await a.getByText('已完成',{exact:true}).waitFor();
   await a.getByRole('button',{name:'调整策略',exact:true}).click();
   const strategyEditor=a.getByRole('form',{name:'Key 7 的策略'});
