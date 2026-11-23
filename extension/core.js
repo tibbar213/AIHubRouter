@@ -85,7 +85,15 @@ export function migrateApp(app) {
   const previousVersion=app.schemaVersion;
   app.defaultStrategy=validateStrategy(upgradeLegacyMode(app.defaultStrategy)||DEFAULT_STRATEGY);
   app.checkMinutes=app.checkMinutes||5;
-  for(const c of app.configs)c.strategy=validateStrategy(upgradeLegacyMode(c.strategy)||app.defaultStrategy);
+  for(const c of app.configs){
+    // Percent thresholds become score gaps for weighted mode; stop auto switching until the user reviews it.
+    const thresholdChanged=['latency','success'].includes(c.strategy?.mode)&&c.strategy.rules?.minImprovement>0;
+    c.strategy=validateStrategy(upgradeLegacyMode(c.strategy)||app.defaultStrategy);
+    if(thresholdChanged&&c.automatic){
+      c.automatic=false;
+      if(Array.isArray(app.logs))app.logs.unshift({at:Date.now(),text:`Key ${c.keyId}：策略已改为自定义，最小改善幅度改按分差计算，已转为只预览，请确认策略后重新开启自动切换`});
+    }
+  }
   if(!(previousVersion>=7)){
     delete app.pricing;
     for(const c of app.configs){
@@ -223,7 +231,7 @@ export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),g
   const reset=(status)=>({state:{...next,candidate:null,count:0,status},target:null});
   if (config.paused) return reset('已暂停');
   if (state.pending) return reset('等待核实上次切换');
-  if (state.expectedGroupId!=null && state.expectedGroupId!==currentGroupId) return {target:null,externalChange:true,state:{...next,expectedGroupId:currentGroupId,observedGroupId:undefined,candidate:null,count:0,observedAt:undefined,status:'检测到分组变化，已更新并等待下轮检查'}};
+  if (state.expectedGroupId!=null && state.expectedGroupId!==currentGroupId) return {target:null,externalChange:true,state:{...next,...(state.choicesOutdated?{choicesOutdated:true}:{}),expectedGroupId:currentGroupId,observedGroupId:undefined,candidate:null,count:0,observedAt:undefined,status:'检测到分组变化，已更新并等待下轮检查'}};
   next.expectedGroupId=currentGroupId;
   const assessed=(snapshot.items||[]).filter(g=>g?.group_models?.some(m=>m.model===config.model)).map(g=>({group:g,...assess(g,config,snapshot,now,strategy)}));
   next.excluded=Object.fromEntries([...new Set(assessed.filter(x=>x.reason).map(x=>x.reason))].map(reason=>[reason,assessed.filter(x=>x.reason===reason).length]));

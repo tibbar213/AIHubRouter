@@ -189,7 +189,7 @@ function candidateTable(config,state){
       row.append(td);
     }
     row.append(candidateBadgeCells(choice,now)[1]);
-    const cell=node('td');cell.dataset.label='操作';if(choice.id===state.expectedGroupId)cell.append(node('span','当前','badge'));else{const button=node('button','切换','quiet');button.setAttribute('aria-label',`切换到 ${choice.code}`);button.disabled=!!state.pending;button.onclick=()=>confirmSwitch(config,state,choice);cell.append(button);}row.append(cell);body.append(row);
+    const cell=node('td');cell.dataset.label='操作';if(choice.id===state.expectedGroupId)cell.append(node('span','当前','badge'));else{const button=node('button','切换','quiet');button.setAttribute('aria-label',`切换到 ${choice.code}`);button.disabled=!!state.pending||!!state.choicesOutdated;button.onclick=()=>confirmSwitch(config,state,choice);cell.append(button);}row.append(cell);body.append(row);
   }
   table.append(body);wrap.append(table);return wrap;
 }

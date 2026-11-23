@@ -266,3 +266,28 @@ test('opening the providers page on connection failure is opt-in, throttled and 
   assert.equal(b.created.length,2);
   assert.ok((await b.send({type:'autoOpen',enabled:'yes'})).error);
 });
+
+test('manual switch is refused without pausing while the candidate list is outdated',async()=>{
+  const b=await boot({automatic:false});await b.send({type:'check'});
+  await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'balanced'}});
+  const r=await b.send({type:'manualSwitch',keyId:7,target:2,expectedGroupId:1});
+  assert.match(r.error,/重新检查/);
+  assert.equal(b.local.app.configs[0].paused,false);
+  assert.equal(b.requests.filter(x=>x.method==='PUT').length,0);
+});
+
+test('catalog opens the providers page when the key list rejects the session after identity',async()=>{
+  const b=await boot();const original=globalThis.fetch;
+  globalThis.fetch=async(url,options)=>new URL(url).pathname==='/api/v1/keys'?{status:401,ok:false}:original(url,options);
+  await b.send({type:'autoOpen',enabled:true});
+  assert.ok((await b.send({type:'catalog'})).error);
+  assert.deepEqual(b.created,[{url:'https://aihub.top/providers',active:false}]);
+});
+
+test('an external group change keeps an outdated candidate list marked outdated',async()=>{
+  const b=await boot({automatic:false});await b.send({type:'check'});
+  await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'balanced'}});
+  b.setActual(3);await b.send({type:'check'});
+  assert.equal(b.local.app.states[7].expectedGroupId,3);assert.equal(b.local.app.states[7].choicesOutdated,true);
+  await b.send({type:'check'});assert.equal(b.local.app.states[7].choicesOutdated,undefined);
+});

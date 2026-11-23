@@ -10,7 +10,9 @@ background=background.replace(/function serial\(fn\) \{[^\n]+/,`function serial(
 const start=background.indexOf('async function connectOpenTab()');
 const end=background.indexOf('async function identity(app)',start);
 if(start<0||end<start)throw new Error('Background auth boundary changed; review userscript adapter');
-background=background.slice(0,start)+`async function connectOpenTab(){ disconnected=false; }\n`+background.slice(end);
+if(!background.slice(start,end).includes('async function openProvidersIfAllowed('))throw new Error('openProvidersIfAllowed moved out of the replaced range; review userscript adapter');
+// Userscripts cannot open background tabs, so the opt-in stays extension-only but the call sites must still resolve.
+background=background.slice(0,start)+`async function connectOpenTab(){ disconnected=false; }\nasync function openProvidersIfAllowed(){}\n`+background.slice(end);
 // Every request uses the current page session, never a stored credential.
 background=background.replace("const {auth}=await chrome.storage.session.get('auth');","const auth=await currentAuth();");
 background=background.replaceAll("await api(`/api/v1/keys/${c.keyId}/group`,", "await identity(app);\n          await api(`/api/v1/keys/${c.keyId}/group`,");
@@ -22,8 +24,9 @@ const userscriptVersion='0.2.1';
 let html=(await read('extension/options.html')).match(/<body>([\s\S]*)<script type="module"/)[1];
 html=html.replace('连接只在本次浏览器会话内保留。重启浏览器后需重新访问平台。','脚本使用当前网站登录会话；至少保留一个 AIHub 标签页。')
  .replace('插件不保存完整 API key；只使用网站登录会话访问 aihub.top。平台页面连接后可以关闭。','不保存完整 API key 或登录令牌。页面关闭后停止；后台标签页、休眠及节能可能延后检查。多个标签页共用锁，不重复改组。请勿同时启用扩展版自动改组。')
- .replace(/<label class="checkbox" id="autoOpenRow">[\s\S]*?<\/label>/,'<input id="autoOpenProviders" type="checkbox" hidden>')
+ .replace(/<label class="checkbox stacked" id="autoOpenRow">[\s\S]*?<\/label>/,'<input id="autoOpenProviders" type="checkbox" hidden>')
  .replace(/AIHubRouter <span id="appVersion">[^<]+/, 'AIHubRouter 油猴版 <span id="appVersion">'+userscriptVersion);
+if(html.includes('autoOpenRow'))throw new Error('autoOpenRow markup changed; review the userscript settings stripping');
 const css=(await read('extension/options.css')).replaceAll(':root',':host').replace(/\bbody\{/g,'.panel{');
 const options=(await read('extension/options.js')).replace(/^import .*\r?\n/,'');
 const runtime=(await read('userscript/runtime.js')).replace('runtime:{sendMessage:', 'runtime:{getManifest:()=>({version:'+JSON.stringify(userscriptVersion)+'}),sendMessage:');

@@ -461,3 +461,15 @@ test('schema 8 maps removed strategies to the closest remaining one and keeps ob
   assert.equal(app.configs[3].strategy.weights.price,1);
   assert.deepEqual(app.states[1],{candidate:2,count:1});assert.equal(migrateApp(app),false);
 });
+
+test('schema 8 latency/success keys with a percent improvement threshold switch to preview on upgrade',()=>{
+  const app={schemaVersion:8,defaultStrategy:{mode:'price'},logs:[],configs:[
+    {keyId:1,automatic:true,strategy:{mode:'latency',rules:{minImprovement:10}}},
+    {keyId:2,automatic:true,strategy:{mode:'success'}},
+    {keyId:3,automatic:true,strategy:{mode:'rate',rules:{minImprovement:10}}}
+  ],states:{}};
+  migrateApp(app);
+  assert.deepEqual(app.configs.map(c=>c.automatic),[false,true,true]);
+  assert.equal(app.configs[0].strategy.rules.minImprovement,10);
+  assert.equal(app.logs.length,1);assert.match(app.logs[0].text,/Key 1.*只预览/);
+});

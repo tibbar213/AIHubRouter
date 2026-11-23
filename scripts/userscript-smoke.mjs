@@ -126,6 +126,15 @@ try{
   await a.getByText('已完成',{exact:true}).waitFor();
   await b.reload();await b.evaluate(script);
   assert.equal((await send(b,{type:'state'})).result.connected,false);
+  // A check while disconnected must report the login error, not crash on extension-only helpers.
+  await b.evaluate(()=>{const key='TEST_GM:aihubrouter:app:v1',raw=JSON.parse(localStorage.getItem(key)),wrapped=typeof raw==='string',app=wrapped?JSON.parse(raw):raw;
+    app.accountMismatch=false;for(const c of app.configs)c.paused=false;localStorage.setItem(key,JSON.stringify(wrapped?JSON.stringify(app):app));});
+  const disconnectedCheck=await send(b,{type:'check'});
+  assert.equal(disconnectedCheck.error,undefined);
+  assert.match((await send(b,{type:'state'})).result.app.lastError,/登录已失效/);
+  assert.equal(writes,3);
+  assert.equal(await a.locator('#autoOpenProviders').isHidden(),true);
+  assert.equal(await a.locator('#autoOpenRow').count(),0);
   await a.screenshot({path:join(profile,'userscript-desktop.png')});
   await a.setViewportSize({width:390,height:844});
   assert.equal(await a.locator('.panel').evaluate(e=>e.scrollWidth<=e.clientWidth),true);

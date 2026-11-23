@@ -191,6 +191,7 @@ async function handle(message,pauseRequest,disconnectRequest){
     if(!Number.isSafeInteger(message.keyId)||!Number.isSafeInteger(message.target)||(message.expectedGroupId!==null&&!Number.isSafeInteger(message.expectedGroupId)))throw new Error('FORMAT');
     const c=app.configs.find(x=>x.keyId===message.keyId);if(!c)throw new Error('FORMAT');
     if(app.states[c.keyId]?.pending)throw new Error('请先核实上次切换结果');
+    if(app.states[c.keyId]?.choicesOutdated)throw new Error('策略已更改，请等待重新检查后再切换');
     c.paused=true;
     app.states[c.keyId]={...app.states[c.keyId],candidate:null,count:0,status:'手动操作中，自动选择已暂停'};
     await save(app);
@@ -225,8 +226,8 @@ async function handle(message,pauseRequest,disconnectRequest){
     app.autoOpenProviders=message.enabled;await save(app);return {ok:true};
   }
   if(message.type==='catalog'){
-    try{await connectedIdentity(app);}catch(e){await openProvidersIfAllowed(app,e);await save(app);throw e;}
-    const [all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);await save(app);
+    let all,snapshot;
+    try{await connectedIdentity(app);[all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);}catch(e){await openProvidersIfAllowed(app,e);await save(app);throw e;}app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);await save(app);
     return app.catalog;
   }
   if(message.type==='configure'){
