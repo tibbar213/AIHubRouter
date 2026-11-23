@@ -303,8 +303,8 @@ async function refresh(){
 }
 async function act(fn){
   clearTimeout(messageTimer);
-  $('message').textContent='正在处理…';$('message').dataset.tone='busy';const buttons=[...document.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);
-  try{await fn();if($('message').textContent==='正在处理…')$('message').textContent='已完成';$('message').dataset.tone='success';await refresh();if($('message').textContent==='已完成')messageTimer=setTimeout(()=>{$('message').textContent='';},4500);}catch(e){$('message').textContent=e.message;$('message').dataset.tone='error';}finally{buttons.forEach(b=>b.disabled=false);}
+  $('message').textContent='正在处理…';$('message').dataset.tone='busy';const buttons=[...document.querySelectorAll('button')].map(b=>[b,b.disabled]);buttons.forEach(([b])=>b.disabled=true);
+  try{await fn();if($('message').textContent==='正在处理…')$('message').textContent='已完成';$('message').dataset.tone='success';await refresh();if($('message').textContent==='已完成')messageTimer=setTimeout(()=>{$('message').textContent='';},4500);}catch(e){$('message').textContent=e.message;$('message').dataset.tone='error';}finally{buttons.forEach(([b,was])=>b.disabled=was);}
 }
 $('catalog').onclick=$('refreshCatalog').onclick=()=>act(async()=>{catalog=await send({type:'catalog'});appliedCatalogAt=catalog.at;});
 $('disconnect').onclick=()=>confirmAction('确认断开并暂停',['将断开平台连接并暂停全部监控。'],'确认断开',{type:'disconnect'});

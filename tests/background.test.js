@@ -291,3 +291,22 @@ test('an external group change keeps an outdated candidate list marked outdated'
   assert.equal(b.local.app.states[7].expectedGroupId,3);assert.equal(b.local.app.states[7].choicesOutdated,true);
   await b.send({type:'check'});assert.equal(b.local.app.states[7].choicesOutdated,undefined);
 });
+
+test('a rejected outdated manual switch does not pause the key on the next check',async()=>{
+  const b=await boot({automatic:false});await b.send({type:'check'});
+  await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'balanced'}});
+  assert.ok((await b.send({type:'manualSwitch',keyId:7,target:2,expectedGroupId:1})).error);
+  await b.send({type:'check'});
+  assert.equal(b.local.app.configs[0].paused,false);
+  assert.equal(b.local.app.states[7].choicesOutdated,undefined);
+});
+
+test('a catalog 401 after identity does not record the session as recovered',async()=>{
+  const b=await boot({auth:false,automatic:false});await b.send({type:'check'});
+  assert.equal(b.local.app.notices['read-AUTH'],true);
+  b.session.auth='Bearer TEST_SESSION_ONLY';const original=globalThis.fetch;
+  globalThis.fetch=async(url,options)=>new URL(url).pathname==='/api/v1/keys'?{status:401,ok:false}:original(url,options);
+  assert.ok((await b.send({type:'catalog'})).error);
+  assert.equal(b.local.app.notices['read-AUTH'],true);
+  assert.ok(!b.local.app.logs.some(l=>/会话已恢复/.test(l.text)));
+});

@@ -519,8 +519,10 @@ async function handle(message,pauseRequest,disconnectRequest){
   if(message.type==='manualSwitch'){
     if(!Number.isSafeInteger(message.keyId)||!Number.isSafeInteger(message.target)||(message.expectedGroupId!==null&&!Number.isSafeInteger(message.expectedGroupId)))throw new Error('FORMAT');
     const c=app.configs.find(x=>x.keyId===message.keyId);if(!c)throw new Error('FORMAT');
-    if(app.states[c.keyId]?.pending)throw new Error('请先核实上次切换结果');
-    if(app.states[c.keyId]?.choicesOutdated)throw new Error('策略已更改，请等待重新检查后再切换');
+    // Rejections before the pause is saved must not leave the urgent pause flag behind.
+    const reject=text=>{if(urgentPause.get(c.keyId)===pauseRequest)urgentPause.delete(c.keyId);throw new Error(text);};
+    if(app.states[c.keyId]?.pending)reject('请先核实上次切换结果');
+    if(app.states[c.keyId]?.choicesOutdated)reject('策略已更改，请等待重新检查后再切换');
     c.paused=true;
     app.states[c.keyId]={...app.states[c.keyId],candidate:null,count:0,status:'手动操作中，自动选择已暂停'};
     await save(app);
@@ -558,7 +560,13 @@ async function handle(message,pauseRequest,disconnectRequest){
   if(message.type==='catalog'){
     await GM.setValue(DISCONNECTED,false);disconnected=false;
     let all,snapshot;
-    try{await connectedIdentity(app);[all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);}catch(e){await openProvidersIfAllowed(app,e);await save(app);throw e;}app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);await save(app);
+    try{await connectedIdentity(app);[all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);}catch(e){
+      // Record only the auto-open; session recovery is not real until the catalog read succeeds.
+      const fresh=await load(),before=fresh.lastAutoOpenAt;
+      await openProvidersIfAllowed(fresh,e);
+      if(fresh.lastAutoOpenAt!==before)await save(fresh);
+      throw e;
+    }app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);await save(app);
     return app.catalog;
   }
   if(message.type==='configure'){
@@ -947,8 +955,8 @@ async function refresh(){
 }
 async function act(fn){
   clearTimeout(messageTimer);
-  $('message').textContent='正在处理…';$('message').dataset.tone='busy';const buttons=[...document.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);
-  try{await fn();if($('message').textContent==='正在处理…')$('message').textContent='已完成';$('message').dataset.tone='success';await refresh();if($('message').textContent==='已完成')messageTimer=setTimeout(()=>{$('message').textContent='';},4500);}catch(e){$('message').textContent=e.message;$('message').dataset.tone='error';}finally{buttons.forEach(b=>b.disabled=false);}
+  $('message').textContent='正在处理…';$('message').dataset.tone='busy';const buttons=[...document.querySelectorAll('button')].map(b=>[b,b.disabled]);buttons.forEach(([b])=>b.disabled=true);
+  try{await fn();if($('message').textContent==='正在处理…')$('message').textContent='已完成';$('message').dataset.tone='success';await refresh();if($('message').textContent==='已完成')messageTimer=setTimeout(()=>{$('message').textContent='';},4500);}catch(e){$('message').textContent=e.message;$('message').dataset.tone='error';}finally{buttons.forEach(([b,was])=>b.disabled=was);}
 }
 $('catalog').onclick=$('refreshCatalog').onclick=()=>act(async()=>{catalog=await send({type:'catalog'});appliedCatalogAt=catalog.at;});
 $('disconnect').onclick=()=>confirmAction('确认断开并暂停',['将断开平台连接并暂停全部监控。'],'确认断开',{type:'disconnect'});
