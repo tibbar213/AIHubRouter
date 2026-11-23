@@ -5,7 +5,7 @@ const clone=x=>structuredClone(x);
 async function boot({pending=false,automatic=true,auth=true,noPrices=false,cacheRates=false,modelHealthOnly=false}={}){
   const listeners={},local={},session=auth?{auth:'Bearer TEST_SESSION_ONLY'}:{};
   let actual=1,failWrite=false,user=10,requests=[],notices=[],stale=false;
-  const config={keyId:7,model:'model-test',platform:'openai',automatic,paused:false};
+  const config={keyId:7,model:'model-test',platform:'openai',automatic,paused:false,strategy:{mode:'price'}};
   local.app={configs:[config],states:{7:{expectedGroupId:1,...(pending?{pending:{from:1,to:2}}:{})}},logs:[],notices:{},pricing:{verified:true,basis:'base-times-rate'},account:10};
   function area(data){return {get:async key=>({[key]:clone(data[key])}),set:async obj=>Object.assign(data,clone(obj)),remove:async key=>{delete data[key];},setAccessLevel:async()=>{}};}
   globalThis.chrome={storage:{local:area(local),session:area(session)},runtime:{id:'test-id',getURL:p=>'chrome-extension://test-id/'+p,onMessage:{addListener:fn=>listeners.message=fn},onStartup:{addListener:fn=>listeners.start=fn},onInstalled:{addListener:()=>{}},openOptionsPage:async()=>{}},notifications:{create:async(id,x)=>notices.push({id,...x})},webRequest:{onBeforeSendHeaders:{addListener:fn=>listeners.auth=fn},onBeforeRequest:{addListener:fn=>listeners.external=fn}},alarms:{get:async()=>({}),create:async()=>{},onAlarm:{addListener:()=>{}}},action:{onClicked:{addListener:()=>{}}}};
@@ -44,10 +44,11 @@ async function boot({pending=false,automatic=true,auth=true,noPrices=false,cache
     }else throw new Error('Unexpected path '+path);
     return {ok:true,status:200,json:async()=>({code:0,data})};
   };
-  globalThis.chrome.tabs={query:async()=>[]};globalThis.chrome.scripting={executeScript:async()=>[]};
+  const created=[];
+  globalThis.chrome.tabs={query:async()=>[],create:async opts=>{created.push(opts);return {id:99};}};globalThis.chrome.scripting={executeScript:async()=>[]};
   await import(`../extension/background.js?test=${seq++}`);
   const send=message=>new Promise(resolve=>listeners.message(message,{id:'test-id',url:'chrome-extension://test-id/options.html'},resolve));
-  return {send,local,session,listeners,requests,notices,setActual:n=>actual=n,setUser:n=>user=n,setStale:v=>stale=v,loseResponse:()=>failWrite=true};
+  return {send,local,session,listeners,requests,notices,created,setActual:n=>actual=n,setUser:n=>user=n,setStale:v=>stale=v,loseResponse:()=>failWrite=true};
 }
 test('stale platform snapshot reports expiry and never switches',async()=>{const b=await boot();b.setStale(true);await b.send({type:'check'});assert.match(b.local.app.lastError,/数据已过期/);assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);});
 test('background writes only group_id and persists no API key or session token',async()=>{
@@ -79,33 +80,13 @@ test('automatic all-unpriced fallback writes the lower account rate and confirms
   assert.equal(preview.requests.filter(r=>r.method==='PUT').length,0);
 });
 
-test('per-key rate strategy is saved and performs an automatic switch',async()=>{
-  const b=await boot();
-  const update=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'rate'}});
-  assert.equal(update.error,undefined);assert.equal(b.local.app.configs[0].strategy.mode,'rate');
-  await b.send({type:'check'});
-  assert.deepEqual(b.requests.filter(r=>r.method==='PUT').map(r=>JSON.parse(r.body)),[{group_id:2}]);
-  assert.equal(b.local.app.states[7].rankingBasis,'rate');
-  assert.equal(b.local.app.states[7].expectedGroupId,2);
-});
-
 test('per-key cache threshold persists and prevents writes without model cache data',async()=>{
   const b=await boot();
-  const result=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'rate',rules:{minCacheHit:80}}});
+  const result=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'price',rules:{minCacheHit:80}}});
   assert.equal(result.error,undefined);assert.equal(b.local.app.configs[0].strategy.rules.minCacheHit,80);
   await b.send({type:'check'});
   assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);
   assert.equal(b.local.app.states[7].excluded['指定模型缓存率未知或数据未就绪'],1);
-});
-
-test('cache priority saves and switches a healthy current channel to the higher cache rate',async()=>{
-  const b=await boot({cacheRates:true});
-  const result=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'cacheHit'}});
-  assert.equal(result.error,undefined);assert.equal(b.local.app.configs[0].strategy.mode,'cacheHit');
-  await b.send({type:'check'});
-  assert.deepEqual(b.requests.filter(r=>r.method==='PUT').map(r=>JSON.parse(r.body)),[{group_id:2}]);
-  assert.equal(b.local.app.states[7].expectedGroupId,2);assert.equal(b.local.app.states[7].rankingBasis,'cacheHit');
-  await b.send({type:'check'});assert.equal(b.requests.filter(r=>r.method==='PUT').length,1);
 });
 
 test('lost mutation response journals intent then next cycle reads back without replaying',async()=>{
@@ -160,22 +141,22 @@ test('credentials are captured only from platform tab requests, not extension re
 });
 test('editing the default template preserves existing key strategies and observations',async()=>{
   const b=await boot();await b.send({type:'state'});
-  b.local.app.configs.push({keyId:8,strategy:{mode:'success'},paused:false});
+  b.local.app.configs.push({keyId:8,strategy:{mode:'balanced'},paused:false});
   b.local.app.states[7]={candidate:2,count:2,pending:{from:1,to:2}};
   b.local.app.states[8]={candidate:9,count:2};
-  const r=await b.send({type:'strategy',strategy:{mode:'latency'}});assert.equal(r.error,undefined);
-  assert.equal(b.local.app.defaultStrategy.mode,'latency');assert.equal(b.local.app.configs[0].strategy.mode,'price');assert.equal(b.local.app.states[7].count,2);
+  const r=await b.send({type:'strategy',strategy:{mode:'weighted'}});assert.equal(r.error,undefined);
+  assert.equal(b.local.app.defaultStrategy.mode,'weighted');assert.equal(b.local.app.configs[0].strategy.mode,'price');assert.equal(b.local.app.states[7].count,2);
   assert.deepEqual(b.local.app.states[7].pending,{from:1,to:2});assert.equal(b.local.app.states[8].count,2);
 });
 test('configure copies the default for new keys and preserves the strategy on rebinding',async()=>{
   const b=await boot();
   const base={type:'configure',keyId:7,model:'model-test',automatic:false};
   const invalid=await b.send({...base,strategy:{mode:'weighted',weights:{price:0,latency:0,success:0}}});assert.ok(invalid.error);
-  await b.send({...base,strategy:{mode:'success'}});assert.equal(b.local.app.configs[0].strategy.mode,'success');
-  await b.send({type:'strategy',strategy:{mode:'latency'}});
-  await b.send(base);assert.equal(b.local.app.configs[0].strategy.mode,'success');
+  await b.send({...base,strategy:{mode:'balanced'}});assert.equal(b.local.app.configs[0].strategy.mode,'balanced');
+  await b.send({type:'strategy',strategy:{mode:'weighted'}});
+  await b.send(base);assert.equal(b.local.app.configs[0].strategy.mode,'balanced');
   await b.send({type:'remove',keyId:7});
-  await b.send(base);assert.equal(b.local.app.configs[0].strategy.mode,'latency');
+  await b.send(base);assert.equal(b.local.app.configs[0].strategy.mode,'weighted');
 });
 test('inline strategy updates only the selected key and preserves its monitoring controls',async()=>{
   const b=await boot();
@@ -183,20 +164,20 @@ test('inline strategy updates only the selected key and preserves its monitoring
   b.local.app.configs[0].strategy.requireDetection=false;
   b.local.app.configs[0].excludeWarnings=true;
   b.local.app.configs[0].paused=true;
-  b.local.app.configs.push({keyId:8,strategy:{mode:'success'},paused:false});
+  b.local.app.configs.push({keyId:8,strategy:{mode:'balanced'},paused:false});
   b.local.app.states[7].count=2;
   b.local.app.states[8]={candidate:9,count:2};
-  const change=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'latency',rules:{confirmRounds:3}}});
+  const change=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'weighted',weights:{latency:100},rules:{confirmRounds:3}}});
   assert.equal(change.error,undefined);
   const [updated,other]=b.local.app.configs;
-  assert.equal(updated.strategy.mode,'latency');
+  assert.equal(updated.strategy.mode,'weighted');
   assert.equal(updated.strategy.rules.confirmRounds,3);
   assert.equal(updated.strategy.requireDetection,false);
   assert.equal(updated.automatic,true);
   assert.equal(updated.excludeWarnings,true);
   assert.equal(updated.paused,true);
-  assert.equal(other.strategy.mode,'success');
-  assert.equal(b.local.app.defaultStrategy.mode,'price');
+  assert.equal(other.strategy.mode,'balanced');
+  assert.equal(b.local.app.defaultStrategy.mode,'balanced');
   assert.equal(b.local.app.states[7].count,0);
   assert.equal(b.local.app.states[8].count,2);
   assert.equal(b.requests.length,0);
@@ -249,4 +230,39 @@ test('catalog stops waiting and reports an error when browser tab lookup hangs',
   assert.match(r.error,/超时/);
   assert.equal(b.requests.length,0);
   assert.ok((await b.send({type:'state'})).result);
+});
+
+test('changing a key strategy keeps the last candidate list visible until the next check',async()=>{
+  const b=await boot({automatic:false});await b.send({type:'check'});
+  const before=b.local.app.states[7].choices.map(c=>c.id);assert.ok(before.length);
+  const r=await b.send({type:'keyStrategy',keyId:7,strategy:{mode:'balanced'}});assert.equal(r.error,undefined);
+  const s=b.local.app.states[7];
+  assert.deepEqual(s.choices.map(c=>c.id),before);assert.equal(s.choicesOutdated,true);assert.equal(s.count,0);
+  await b.send({type:'check'});
+  assert.equal(b.local.app.states[7].choicesOutdated,undefined);assert.ok(b.local.app.states[7].choices);
+});
+
+test('opening the providers page on connection failure is opt-in, throttled and skipped when a tab exists',async()=>{
+  const b=await boot({auth:false});
+  await b.send({type:'check'});
+  assert.deepEqual(b.created,[]);
+  assert.equal((await b.send({type:'autoOpen',enabled:true})).error,undefined);
+  assert.equal(b.local.app.autoOpenProviders,true);
+  await b.send({type:'check'});
+  assert.deepEqual(b.created,[{url:'https://aihub.top/providers',active:false}]);
+  await b.send({type:'check'});
+  assert.equal(b.created.length,1);
+  b.local.app.lastAutoOpenAt=0;
+  chrome.tabs.query=async()=>[{id:3}];
+  await b.send({type:'check'});
+  assert.equal(b.created.length,1);
+  chrome.tabs.query=async()=>[];
+  b.local.app.lastAutoOpenAt=0;
+  assert.ok((await b.send({type:'catalog'})).error);
+  assert.equal(b.created.length,2);
+  b.local.app.lastAutoOpenAt=0;
+  await b.send({type:'autoOpen',enabled:false});
+  await b.send({type:'check'});
+  assert.equal(b.created.length,2);
+  assert.ok((await b.send({type:'autoOpen',enabled:'yes'})).error);
 });

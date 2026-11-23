@@ -5,6 +5,7 @@ const now=Date.parse('2026-10-30T05:00:00Z');
 const config={keyId:1,model:'test-model'};
 function group(id,cost=1,platform='openai'){return {group_id:id,code:`G${id}`,platform,rate_multiplier:1,bindable:true,available:true,probe_state:'enabled',probe_expires_at:new Date(now+INTERVAL*10).toISOString(),subscription_type:'standard',model_detection:{model:'test-model',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'test-model',price:{input_per_million:cost,output_per_million:cost}}],summary_models:{'test-model':{range_cache:{ready:true,stale:false}}},model_cards:[{model:'test-model',probe_state:'enabled',health:'healthy',health_expires_at:new Date(now+INTERVAL*10).toISOString()}]};}
 function snapshot(items,time=now){return {items,stale:false,generated_at:new Date(time).toISOString()};}
+const only=(k,extra={})=>({mode:'weighted',weights:{price:0,latency:0,success:0,popularity:0,stars:0,[k]:100},...extra});
 function run(items,state={},time=now,extra={}){return decide({config,state,currentGroupId:1,snapshot:snapshot(items,time),now:time,globalStrategy:{mode:'price',rules:{confirmRounds:2}},...extra});}
 test('matches by bound model across platforms despite a legacy platform field',()=>{
   const current=group(1,1),other=group(2,.2,'gemini'),unlisted=group(3,.01);
@@ -24,7 +25,7 @@ test('model price blends input and output by the default 3:1 profile and applies
   assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:1.99},usage:{cacheRate:0}}}).state.excluded['模型价格超过上限'],1);
   assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:2},usage:{cacheRate:0}}}).state.choices[0].cost,2);
   g.rate_multiplier=NaN;
-  assert.equal(assess(g,config,snapshot([g]),now).priceReason,'账号倍率无效，无法计算模型价格');
+  assert.equal(assess(g,config,snapshot([g]),now,{mode:'price'}).priceReason,'账号倍率无效，无法计算模型价格');
 });
 test('model cost can favor a higher rate when its list price is lower',()=>{
   const a=group(1,5),b=group(2,.2);a.rate_multiplier=.5;b.rate_multiplier=2;
@@ -142,30 +143,6 @@ test('all unpriced channels use account rates with confirmation, ties and improv
   assert.equal(run(items,{lastSwitchAt:now},now,{globalStrategy:{mode:'price',rules:{cooldownMinutes:1}}}).target,null);
 });
 
-test('explicit rate mode uses account rates regardless of model prices and retains equal rates',()=>{
-  const current=group(1,.01),other=group(2,10);
-  current.rate_multiplier=.2;other.rate_multiplier=.12;
-  current.public_rate_multiplier=.01;other.public_rate_multiplier=10;
-  const extra={globalStrategy:{mode:'rate',rules:{confirmRounds:2}}};
-  const first=run([current,other],{},now,extra);
-  assert.equal(first.state.candidate,2);assert.equal(first.target,null);
-  assert.equal(first.state.rankingBasis,'rate');
-  assert.equal(run([current,other],first.state,now+INTERVAL,extra).target,2);
-  delete other.group_models[0].price;
-  assert.equal(run([current,other],{},now,{globalStrategy:{mode:'rate'}}).target,2);
-  assert.equal(run([current,other],{},now,{globalStrategy:{mode:'rate',rules:{minImprovement:41}}}).target,null);
-  assert.equal(run([current,other],{lastSwitchAt:now},now,{globalStrategy:{mode:'rate',rules:{cooldownMinutes:1}}}).target,null);
-  other.rate_multiplier=.2;
-  assert.equal(run([current,other],{},now,extra).target,null);
-  assert.match(run([current,other],{},now,extra).state.status,/同倍率不切/);
-  for(const rate of [undefined,null,-1,NaN,Infinity,'0.1']){
-    other.rate_multiplier=rate;
-    assert.deepEqual(run([current,other],{},now,extra).state.excluded,{'账号倍率无效或未知':1});
-  }
-  other.rate_multiplier=0;
-  assert.equal(run([current,other],{},now,{globalStrategy:{mode:'rate'}}).target,2);
-});
-
 test('rate fallback never invents rates or bypasses price caps and resets when prices recover',()=>{
   const current=group(1,null),other=group(2,null);current.rate_multiplier=.2;other.rate_multiplier=0;
   assert.equal(run([current,other],{},now,{globalStrategy:{mode:'price'}}).target,2);
@@ -184,7 +161,7 @@ test('rate fallback never invents rates or bypasses price caps and resets when p
 });
 test('migration removes old formula settings, resets observations and preserves pending writes and opt-in',()=>{
   const app={configs:[{keyId:1,profile:{ratio:15},automatic:true,paused:true}],pricing:{verified:true},states:{1:{expectedGroupId:3,pending:{from:3,to:4},candidate:4,count:2,choices:[{cost:99}]} }};
-  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,8);
+  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,9);
   assert.equal(app.pricing,undefined);assert.equal(app.configs[0].profile,undefined);
   assert.equal(app.configs[0].automatic,true);assert.equal(app.configs[0].paused,true);
   assert.equal(app.states[1].count,0);assert.equal(app.states[1].choices,undefined);
@@ -193,12 +170,12 @@ test('migration removes old formula settings, resets observations and preserves 
 test('schema 7 copies each effective strategy without clearing observations or pending writes',()=>{
   const pending={from:1,to:2};
   const app={schemaVersion:7,defaultStrategy:{mode:'weighted',rules:{allowIds:[2]}},
-    configs:[{keyId:1,strategy:null,automatic:true,paused:true,excludeWarnings:true},{keyId:2,strategy:{mode:'success'}}],
+    configs:[{keyId:1,strategy:null,automatic:true,paused:true,excludeWarnings:true},{keyId:2,strategy:only('success')}],
     states:{1:{pending,candidate:2,count:1,observedAt:now}}
   };
   assert.equal(migrateApp(app),true);
   assert.deepEqual(app.configs[0].strategy,app.defaultStrategy);
-  assert.equal(app.configs[1].strategy.mode,'success');
+  assert.equal(app.configs[1].strategy.mode,'weighted');assert.deepEqual(app.configs[1].strategy.weights,{price:0,latency:0,success:100,popularity:0,stars:0});
   assert.equal(app.configs[0].paused,true);
   assert.equal(app.configs[0].excludeWarnings,true);
   assert.deepEqual(app.states[1],{pending,candidate:2,count:1,observedAt:now});
@@ -238,7 +215,7 @@ test('external edits reset baseline and pending writes never produce another tar
 });
 test('failed, unknown, stale, unsupported model and unsupported groups are excluded',()=>{
   for(const mutate of [g=>g.available=false,g=>g.availability_unknown=true,g=>g.bindable=false,g=>g.key_max_rate_multiplier=.1,g=>g.probe_state='disabled',g=>g.model_cards[0].health='insufficient',g=>g.group_models=[],g=>g.subscription_type='subscription',g=>g.probe_expires_at=null]){
-    const g=group(1);mutate(g);assert.ok(assess(g,config,snapshot([g]),now).reason);
+    const g=group(1);mutate(g);assert.ok(assess(g,config,snapshot([g]),now,{mode:'price'}).reason);
   }
   assert.ok(assess(group(1),config,{...snapshot([]),stale:true},now).reason);
   assert.ok(assess(group(1),config,snapshot([],now-INTERVAL-1),now).reason);
@@ -248,7 +225,7 @@ test('Hall detects availability from a fresh card for the exact configured model
   delete g.probe_state;
   delete g.probe_expires_at;
   delete g.model_cards[0].probe_state;
-  const check=()=>assess(g,config,snapshot([g]),now);
+  const check=()=>assess(g,config,snapshot([g]),now,{mode:'price'});
   assert.equal(check().cost,1);
 
   g.model_cards.push({...g.model_cards[0],model:'other-model'});
@@ -265,7 +242,7 @@ test('authenticated Hall fields do not veto a fresh card for a bindable group',(
   const g={...group(1),visible_in_hall:false,available:false,detections_enabled:true,probe_skipped:false};
   const check=(overrides={})=>{
     const candidate={...g,...overrides};
-    return assess(candidate,config,snapshot([candidate]),now);
+    return assess(candidate,config,snapshot([candidate]),now,{mode:'price'});
   };
   assert.equal(check().cost,1);
   assert.equal(check({visible_in_hall:true}).cost,1);
@@ -278,7 +255,7 @@ test('authenticated Hall fields do not veto a fresh card for a bindable group',(
 });
 test('valid model list prices are used with special billing flags',()=>{
   const g={...group(1),long_context_pricing_enabled:true,peak_rate_enabled:true};
-  assert.equal(assess(g,config,snapshot([g]),now).cost,1);
+  assert.equal(assess(g,config,snapshot([g]),now,{mode:'price'}).cost,1);
 });
 test('pending readback pauses if unchanged and accepts a third group without retrying',()=>{
   const s={pending:{from:1,to:2}};
@@ -292,12 +269,12 @@ function measured(id,price,latency,success){
 }
 test('global latency strategy picks fastest even if model price is missing',()=>{
   const gs=[measured(1,1,3000,.99),measured(2,null,500,.9)];
-  const a=run(gs,{},now,{globalStrategy:{mode:'latency'}});
+  const a=run(gs,{},now,{globalStrategy:only('latency')});
   assert.equal(a.state.candidate,2);assert.equal(a.state.choices[0].cost,null);
 });
 test('per-key success strategy overrides global latency strategy',()=>{
   const gs=[measured(1,1,500,.9),measured(2,1,3000,.99)];
-  assert.equal(run(gs,{},now,{globalStrategy:{mode:'latency'},config:{...config,strategy:{mode:'success'}}}).state.candidate,2);
+  assert.equal(run(gs,{},now,{globalStrategy:only('latency'),config:{...config,strategy:only('success')}}).state.candidate,2);
 });
 test('weighted tradeoff follows weights and is invariant to weight sum',()=>{
   const gs=[measured(1,.1,3000,.9),measured(2,.5,500,.99)];
@@ -314,33 +291,34 @@ test('zero-weight missing metrics ignored; positive-weight missing metrics exclu
 });
 test('missing model metrics do not borrow group latency or success; zero samples excluded',()=>{
   const g=group(2,.1);g.user_latency_ms=1;g.success_rates={'1h':1};
-  assert.equal(run([g],{},now,{globalStrategy:{mode:'latency'}}).notice,'no-candidate');
+  assert.equal(run([g],{},now,{globalStrategy:only('latency')}).notice,'no-candidate');
   Object.assign(g.summary_models['test-model'],{sample_count:0,user_latency_ms:1,success_rate:1});
-  assert.equal(run([g],{},now,{globalStrategy:{mode:'success'}}).notice,'no-candidate');
+  assert.equal(run([g],{},now,{globalStrategy:only('success')}).notice,'no-candidate');
 });
 test('equal weighted scores keep current and constant metrics never divide by zero',()=>{
   const gs=[measured(1,.1,1000,.95),measured(2,.2,1000,.99)];
   const a=run(gs,{},now,{globalStrategy:{mode:'weighted',weights:{price:50,latency:0,success:50}}});assert.equal(a.target,null);assert.equal(a.state.choices[0].score,50);
-  const b=run(gs,{},now,{globalStrategy:{mode:'latency'}});assert.equal(b.target,null);assert.equal(b.state.choices[0].score,100);
+  const b=run(gs,{},now,{globalStrategy:only('latency')});assert.equal(b.target,null);assert.equal(b.state.choices[0].score,100);
 });
 test('strategy change restarts confirmation even when the same group remains best',()=>{
   const gs=[measured(1,1,3000,.9),measured(2,.1,500,.99)],a=run(gs);
-  const b=run(gs,a.state,now+INTERVAL,{globalStrategy:{mode:'latency',rules:{confirmRounds:2}}});
+  const b=run(gs,a.state,now+INTERVAL,{globalStrategy:only('latency',{rules:{confirmRounds:2}})});
   assert.equal(b.target,null);assert.equal(b.state.count,1);
 });
 test('bad weights and unknown modes are rejected; omitted weights have valid defaults',()=>{
-  for(const s of [{mode:'other'},{mode:'weighted',weights:{price:0,latency:0,success:0}},{mode:'weighted',weights:{price:-1}},{mode:'weighted',weights:{price:Infinity}},{mode:'weighted',weights:{price:101}}])assert.throws(()=>validateStrategy(s));
-  assert.deepEqual(validateStrategy({mode:'price'}),DEFAULT_STRATEGY);
+  for(const s of [{mode:'other'},{mode:'weighted',weights:{price:0,latency:0,success:0,popularity:0,stars:0}},{mode:'weighted',weights:{price:-1}},{mode:'weighted',weights:{price:Infinity}},{mode:'weighted',weights:{price:101}}])assert.throws(()=>validateStrategy(s));
+  assert.deepEqual(validateStrategy({mode:'price'}),{...DEFAULT_STRATEGY,mode:'price'});
+  assert.equal(DEFAULT_STRATEGY.mode,'balanced');
 });
 test('channel detection rejects failed or incomplete results; toggle is explicit',()=>{
   for(const change of [g=>delete g.model_detection,g=>g.model_detection.status='suspected',g=>g.model_detection.status='detection_failed',g=>g.model_detection.execution_complete=false]){
-    const g=group(1);change(g);assert.equal(assess(g,config,snapshot([g]),now).reason,'检测未通过');
-    assert.equal(assess(g,config,snapshot([g]),now,{...DEFAULT_STRATEGY,requireDetection:false}).cost,1);
+    const g=group(1);change(g);assert.equal(assess(g,config,snapshot([g]),now,{mode:'price'}).reason,'检测未通过');
+    assert.equal(assess(g,config,snapshot([g]),now,{mode:'price',requireDetection:false}).cost,1);
   }
 });
 test('passed channel detection accepts a different detection model',()=>{
   const g=group(1);g.model_detection.model='different-model';g.model_detection.stages={text:{model:'another-model'}};
-  const result=assess(g,config,snapshot([g]),now);assert.equal(result.cost,1);assert.match(result.detection,/检测 different-model/);
+  const result=assess(g,config,snapshot([g]),now,{mode:'price'});assert.equal(result.cost,1);assert.match(result.detection,/检测 different-model/);
 });
 test('a wrong candy answer overrides a platform pass and excludes the cheaper channel',()=>{
   const current=group(1,1), cheaper=group(2,.1), suspected=group(3,.2);
@@ -352,17 +330,17 @@ test('a wrong candy answer overrides a platform pass and excludes the cheaper ch
   assert.deepEqual(rejected.state.excluded,{'检测未通过':2});
   assert.equal(rejected.target,null);
   text.answer='\n 21 ';
-  assert.equal(assess(cheaper,config,snapshot([cheaper]),now).cost,.1);
+  assert.equal(assess(cheaper,config,snapshot([cheaper]),now,{mode:'price'}).cost,.1);
   text.result=false;
-  assert.equal(assess(cheaper,config,snapshot([cheaper]),now).reason,'检测未通过');
+  assert.equal(assess(cheaper,config,snapshot([cheaper]),now,{mode:'price'}).reason,'检测未通过');
 });
 test('over-limit channels are excluded from choices and counted by reason',()=>{
   const current=group(1,1),blocked=group(2,.01);blocked.key_max_rate_multiplier=.5;
   const result=run([current,blocked]);assert.equal(result.target,null);assert.deepEqual(result.state.choices.map(x=>x.id),[1]);assert.equal(result.state.excluded['超过此 key 的倍率上限'],1);
 });
 test('passed detection may omit optional completion fields but explicit false rejects',()=>{
-  const g=group(1);delete g.model_detection.execution_complete;delete g.model_detection.applicable;assert.equal(assess(g,config,snapshot([g]),now).cost,1);
-  g.model_detection.applicable=false;assert.ok(assess(g,config,snapshot([g]),now).reason);
+  const g=group(1);delete g.model_detection.execution_complete;delete g.model_detection.applicable;assert.equal(assess(g,config,snapshot([g]),now,{mode:'price'}).cost,1);
+  g.model_detection.applicable=false;assert.ok(assess(g,config,snapshot([g]),now,{mode:'price'}).reason);
 });
 test('white/black list, quality thresholds and user limits are applied before ranking',()=>{
   const g=measured(2,.5,1500,.95);
@@ -370,36 +348,12 @@ test('white/black list, quality thresholds and user limits are applied before ra
   assert.equal(assess(g,config,snapshot([g]),now,validateStrategy({mode:'price',rules:{allowIds:[2],minSuccess:95,minSamples:100,maxLatency:1500,maxPrice:.5,maxRate:1}})).cost,.5);
 });
 
-test('cache rate priority ranks descending, confirms switches and respects improvement and cooldown',()=>{
-  const current=group(1,.01),other=group(2,null);
-  const cache=rate=>({ready:true,coverage_complete:true,stale:false,usage_records:10,refreshed_at:new Date(now).toISOString(),cache_hit_rate:rate});
-  current.summary_models[config.model].range_cache=cache(.8);
-  other.summary_models[config.model].range_cache=cache(.9);
-  const extra={globalStrategy:{mode:'cacheHit',rules:{confirmRounds:2}}};
-  const first=run([current,other],{},now,extra);
-  assert.deepEqual(first.state.choices.map(x=>x.id),[2,1]);
-  assert.equal(first.state.rankingBasis,'cacheHit');assert.equal(first.target,null);
-  assert.equal(run([current,other],first.state,now+INTERVAL,extra).target,2);
-  assert.equal(run([current,other],first.state,now+1000,extra).state.count,1);
-  for(const rules of [{minImprovement:13},{cooldownMinutes:1}])assert.equal(run([current,other],{lastSwitchAt:now},now,{globalStrategy:{mode:'cacheHit',rules}}).target,null);
-  assert.equal(run([current,other],{},now,{globalStrategy:{mode:'cacheHit',rules:{minImprovement:12.5}}}).target,2);
-  other.summary_models[config.model].range_cache=cache(.8);
-  assert.equal(run([current,other],{},now,extra).target,null);
-  current.summary_models[config.model].range_cache=cache(0);other.summary_models[config.model].range_cache=cache(1);
-  assert.equal(run([current,other],{},now,{globalStrategy:{mode:'cacheHit'}}).target,2);
-  for(const mutate of [c=>c.cache_hit_rate=null,c=>c.stale=true,c=>c.ready=false,c=>c.refreshed_at=new Date(now-INTERVAL-1).toISOString()]){
-    other.summary_models[config.model].range_cache=cache(.9);mutate(other.summary_models[config.model].range_cache);
-    const result=run([current,other],{},now,extra);
-    assert.deepEqual(result.state.choices.map(x=>x.id),[1]);assert.equal(result.state.excluded['指定模型缓存率未知或数据未就绪'],1);
-  }
-});
-
 test('minimum model cache hit rate filters before ranking across strategies',()=>{
   const current=group(1,1),other=group(2,.1);
   const cache=rate=>({ready:true,coverage_complete:true,stale:false,usage_records:10,refreshed_at:new Date(now).toISOString(),cache_hit_rate:rate});
   current.summary_models[config.model].range_cache=cache(.8);
   other.summary_models[config.model].range_cache=cache(.79);
-  for(const mode of ['price','rate','cacheHit','latency','success','weighted']){
+  for(const mode of ['price','balanced','weighted']){
     for(const g of [current,other])Object.assign(g.summary_models[config.model],{sample_count:10,user_latency_ms:1000,success_rate:1});
     const result=run([current,other],{},now,{globalStrategy:{mode,rules:{minCacheHit:80}}});
     assert.equal(result.target,null);assert.deepEqual(result.state.choices.map(x=>x.id),[1]);
@@ -466,4 +420,44 @@ test('cheaper cache price can win even with a higher input price',()=>{
 test('usage profile is validated',()=>{
   for(const usage of [{inputRatio:0},{inputRatio:-1},{inputRatio:'3'},{cacheRate:101},{cacheRate:-1},{measuredCache:'yes'}])assert.throws(()=>validateStrategy({mode:'price',usage}));
   assert.deepEqual(validateStrategy({mode:'price'}).usage,{inputRatio:3,cacheRate:80,measuredCache:true});
+});
+
+test('consumption rank and user rating weights drive scoring and exclude channels without data',()=>{
+  const expires=new Date(now+60000).toISOString();
+  const mk=(id,rank,stars)=>{const g=group(id,.1);g.badges_expires_at=expires;g.badges={popularity:{status:'measured',rank,groups:100,window:'24h',expires_at:expires},warnings:[]};g.reputation={stars};return g;};
+  const w=weights=>({globalStrategy:{mode:'weighted',weights:{price:0,latency:0,success:0,popularity:0,stars:0,...weights}}});
+  const byRank=run([mk(1,90,4.9),mk(2,5,3)],{},now,w({popularity:100}));
+  assert.equal(byRank.target,2);assert.equal(byRank.state.choices[0].id,2);assert.equal(byRank.state.choices[0].popularityRank,5);
+  const byStars=run([mk(1,5,3),mk(2,90,4.8)],{},now,w({stars:100}));
+  assert.equal(byStars.target,2);
+  const mixed=run([mk(1,90,4.9),mk(2,5,3)],{},now,w({popularity:50,stars:50}));
+  assert.equal(mixed.target,null);assert.equal(mixed.state.choices[0].score,50);
+  const noBadge=group(1,.1);
+  assert.equal(run([noBadge],{},now,w({popularity:100})).notice,'no-candidate');
+  assert.equal(run([noBadge],{},now,w({price:100})).state.choices.length,1);
+  const noStars=mk(1,5,3);delete noStars.reputation;
+  assert.equal(run([noStars],{},now,w({stars:100})).notice,'no-candidate');
+  for(const bad of [{popularity:-1},{stars:101},{popularity:Infinity}])assert.throws(()=>validateStrategy({mode:'weighted',weights:bad}));
+});
+
+test('balanced preset blends price, quality, rating and rank; optional data never excludes channels',()=>{
+  const expires=new Date(now+60000).toISOString();
+  const mk=(id,cost,latency,success,stars,rank)=>{const g=measured(id,cost,latency,success);if(stars!=null)g.reputation={stars};if(rank!=null){g.badges_expires_at=expires;g.badges={popularity:{status:'measured',rank,groups:100,window:'24h',expires_at:expires},warnings:[]};}return g;};
+  const bal={globalStrategy:{mode:'balanced'}};
+  const a=run([mk(1,.1,3000,.9,3,90),mk(2,5,500,.99,4.9,5)],{},now,bal);
+  assert.equal(a.state.candidate,2);assert.deepEqual(a.state.choices.map(x=>[x.id,Math.round(x.score)]),[[2,60],[1,40]]);
+  const noOptional=run([mk(1,.1,3000,.9,null,null),mk(2,5,500,.99,4.9,5)],{},now,bal);
+  assert.equal(noOptional.state.choices.length,2);assert.equal(noOptional.target,null);assert.equal(noOptional.state.choices[0].score,50);
+  assert.equal(run([group(1,.1)],{},now,bal).notice,'no-candidate');
+  for(const mode of ['rate','cacheHit','latency','success','experience'])assert.throws(()=>validateStrategy({mode}));
+});
+test('schema 8 maps removed strategies to the closest remaining one and keeps observations',()=>{
+  const app={schemaVersion:8,defaultStrategy:{mode:'cacheHit'},configs:[{keyId:1,strategy:{mode:'rate',rules:{minCacheHit:80}}},{keyId:2,strategy:{mode:'latency'}},{keyId:3,strategy:{mode:'experience'}},{keyId:4,strategy:{mode:'weighted',weights:{price:1}}}],states:{1:{candidate:2,count:1}}};
+  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,9);
+  assert.equal(app.defaultStrategy.mode,'price');
+  assert.deepEqual(app.configs.map(x=>x.strategy.mode),['price','weighted','balanced','weighted']);
+  assert.equal(app.configs[0].strategy.rules.minCacheHit,80);
+  assert.equal(app.configs[1].strategy.weights.latency,100);assert.equal(app.configs[1].strategy.weights.price,0);
+  assert.equal(app.configs[3].strategy.weights.price,1);
+  assert.deepEqual(app.states[1],{candidate:2,count:1});assert.equal(migrateApp(app),false);
 });

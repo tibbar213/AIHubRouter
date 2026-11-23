@@ -14,7 +14,7 @@ try{
     assert.equal(url.origin,'https://aihub.top');
     if(!path.startsWith('/api/'))return route.fulfill({contentType:'text/html',body:'<!doctype html><title>模拟 AIHub</title><h1>模拟平台页面</h1>'});
     const expires=new Date(Date.now()+90000).toISOString();
-    const group=id=>({group_id:id,code:'模拟渠道-'+id,platform:'openai',rate_multiplier:1,available:id!==1,probe_state:'enabled',probe_expires_at:expires,subscription_type:'standard',model_detection:{model:'实际检测模型',status:'passed'},group_models:[{model:'model-test',price:{input_per_million:id===1?1:.1,output_per_million:id===1?1:.1}}],model_cards:[{model:'model-test',health:'healthy',probe_state:'enabled',health_expires_at:expires}]});
+    const group=id=>({group_id:id,code:'模拟渠道-'+id,platform:'openai',rate_multiplier:1,available:id!==1,probe_state:'enabled',probe_expires_at:expires,subscription_type:'standard',model_detection:{model:'实际检测模型',status:'passed'},group_models:[{model:'model-test',price:{input_per_million:id===1?1:.1,output_per_million:id===1?1:.1}}],summary_models:{'model-test':{sample_count:100,user_latency_ms:1000,success_rate:.99}},model_cards:[{model:'model-test',health:'healthy',probe_state:'enabled',health_expires_at:expires}]});
     let data;
     if(path==='/api/v1/auth/me')data={id:user};
     else if(path==='/api/v1/keys')data={pages:1,items:[{id:7,name:'模拟 Key',key:'SECRET_NEVER_STORE',status:'active',group_id:current,max_rate_multiplier:0}]};
@@ -64,7 +64,7 @@ try{
   await a.getByLabel('Key 7 的模型',{exact:true}).selectOption('model-test');
   assert.equal(await a.locator('#appVersion').textContent(),source.match(/^\/\/ @version\s+(.+)$/m)[1]);
   await a.getByText('已完成',{exact:true}).waitFor();
-  await a.getByRole('button',{name:'调整策略',exact:true}).click();
+  await a.getByRole('button',{name:'权重与规则',exact:true}).click();
   const strategyEditor=a.getByRole('form',{name:'Key 7 的策略'});
   await strategyEditor.locator('details summary').click();
   await strategyEditor.locator('[name=confirmRounds]').fill('2');

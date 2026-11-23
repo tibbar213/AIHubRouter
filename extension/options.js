@@ -1,4 +1,4 @@
-import {validateStrategy,strategyLabel,providerBadgeDetails} from './core.js';
+import {validateStrategy,strategyLabel,providerBadgeDetails,presetWeights} from './core.js';
 const $=id=>document.getElementById(id);
 let catalog={keys:[],models:[]},app,globalLoaded=false;
 let appliedCatalogAt=0,connected=false;
@@ -17,9 +17,10 @@ const viewSort=new Map();
 const expandedCandidates=new Set();
 const expandedExclusions=new Set();
 const strategyEditors=new Map();
+const expandStrategy=new Set();
 let messageTimer;
 const ruleInputs=['minSuccess','minCacheHit','minSamples','maxLatency','maxPrice','maxRate','confirmRounds','cooldownMinutes','minImprovement'];
-const weightInputs=['price','latency','success'];
+const weightInputs=['price','latency','success','popularity','stars'];
 async function send(message){let timer;const limit=message.type==='catalog'?35000:message.type==='state'?6000:0;const request=chrome.runtime.sendMessage(message);const reply=limit?await Promise.race([request,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('连接耗时过长，请检查 AIHub 登录状态和网络后重试。')),limit);})]).finally(()=>clearTimeout(timer)):await request;if(reply?.error)throw new Error(reply.error);if(!reply)throw new Error('插件后台未响应');return reply.result;}
 function node(tag,text,cls){const e=document.createElement(tag);if(text!=null)e.textContent=text;if(cls)e.className=cls;return e;}
 function option(select,value,text){const o=node('option',text);o.value=value;select.append(o);}
@@ -29,24 +30,25 @@ function attachStrategyFields(form,strategy){
   fields.mode.value=s.mode;
   for(const key of ruleInputs)fields[key].value=s.rules[key];
   for(const key of ['allowIds','denyIds'])fields[key].value=s.rules[key].join(', ');
-  for(const key of weightInputs)fields[key].value=s.weights[key];
+  let custom={...s.weights};
+  const fillWeights=mode=>{const w=presetWeights(mode,custom);for(const key of weightInputs)fields[key].value=w[key];};
+  fillWeights(s.mode);
   fields.inputRatio.value=s.usage.inputRatio;fields.cacheRate.value=s.usage.cacheRate;fields.measuredCache.checked=s.usage.measuredCache;
-  const toggleWeights=()=>{
-    const weighted=fields.mode.value==='weighted';
-    form.querySelector('[data-weights]').hidden=!weighted;
-    for(const key of weightInputs)fields[key].disabled=!weighted;
-  };
-  form.addEventListener('change',event=>{if(event.target.name==='mode')toggleWeights();});
-  toggleWeights();
+  form.addEventListener('change',event=>{if(event.target.name==='mode')fillWeights(event.target.value);});
+  form.addEventListener('input',event=>{
+    if(!weightInputs.includes(event.target.name))return;
+    fields.mode.value='weighted';
+    custom=Object.fromEntries(weightInputs.map(key=>[key,Number(fields[key].value)]));
+  });
 }
-function readEditor(form,requireDetection){
+function readEditor(form,requireDetection,original){
   const fields=form.elements,mode=fields.mode.value;
   const rules=Object.fromEntries(ruleInputs.map(key=>[key,Number(fields[key].value)]));
   for(const key of ['allowIds','denyIds']){
     const value=fields[key].value.trim();
     rules[key]=value?value.split(/[\s,，]+/).map(Number):[];
   }
-  const weights=Object.fromEntries(weightInputs.map(key=>[key,Number(fields[key].value)]));
+  const weights=mode==='weighted'?Object.fromEntries(weightInputs.map(key=>[key,Number(fields[key].value)])):original?.weights;
   const usage={inputRatio:Number(fields.inputRatio.value),cacheRate:Number(fields.cacheRate.value),measuredCache:fields.measuredCache.checked};
   return validateStrategy({mode,rules,requireDetection,weights,usage});
 }
@@ -54,7 +56,7 @@ function keyStrategyEditor(config){
   const form=node('form',null,'key-strategy-editor');
   form.setAttribute('aria-label',`Key ${config.keyId} 的策略`);
   attachStrategyFields(form,config.strategy);
-  form.prepend(node('h4','调整策略'));
+  form.prepend(node('h4','权重与规则'));
   const actions=node('div',null,'actions'),save=node('button','保存策略'),cancel=node('button','取消','quiet');
   cancel.type='button';
   cancel.onclick=()=>{strategyEditors.delete(config.keyId);form.remove();refresh().catch(()=>{});};
@@ -62,7 +64,8 @@ function keyStrategyEditor(config){
   form.onsubmit=event=>{
     event.preventDefault();
     act(async()=>{
-      await send({type:'keyStrategy',keyId:config.keyId,strategy:readEditor(form,config.strategy.requireDetection)});
+      await send({type:'keyStrategy',keyId:config.keyId,strategy:readEditor(form,config.strategy.requireDetection,config.strategy)});
+      if(!config.paused)await send({type:'check'});
       strategyEditors.delete(config.keyId);
     });
   };
@@ -156,19 +159,18 @@ function confirmSwitch(config,state,target){
 }
 function candidateTable(config,state){
   const wrap=node('div',null,'table-wrap'),table=node('table'),head=node('thead'),header=node('tr');
-  const columns=[['code','渠道',v=>v],['rawMultiplier','原始倍率',v=>v+'×'],['accountMultiplier','账号倍率',v=>v+'×'],['stars','用户评分',v=>'★ '+v.toFixed(2)],['cost','模型价格',v=>'$'+v.toFixed(6)+'/M'],['latency','首响应延迟',v=>Math.round(v)+' ms'],['success','成功率',v=>(v*100).toFixed(2)+'%'],['cacheHit','缓存率',v=>(v*100).toFixed(2)+'%'],['detection','模型检测',v=>v]];
+  const columns=[['code','渠道',v=>v],['rawMultiplier','原始倍率',v=>v+'×'],['accountMultiplier','账号倍率',v=>v+'×'],['stars','用户评分',v=>'★ '+v.toFixed(2)],['cost','模型价格',v=>'$'+v.toFixed(6)+'/M'],['latency','首响应延迟',v=>Math.round(v)+' ms'],['success','成功率',v=>(v*100).toFixed(2)+'%'],['cacheHit','缓存率',v=>(v*100).toFixed(2)+'%'],['detection','模型检测',v=>v],['popularityRank','消费名次',v=>String(v)]];
   const sort=viewSort.get(config.keyId)||{key:'score',direction:-1};
   const sortLabel=node('label','排序显示','compact-sort');const sortSelect=node('select');
-  option(sortSelect,'score:-1',['accountMultiplier','rate'].includes(state.rankingBasis)?'策略排序 · 账号倍率低优先':state.rankingBasis==='cacheHit'?'策略排序 · 缓存率高优先':'策略排序');
+  option(sortSelect,'score:-1',state.rankingBasis==='accountMultiplier'?'策略排序 · 账号倍率低优先':'策略排序');
   for(const [key,label] of columns){option(sortSelect,key+':1',label+' ↑');option(sortSelect,key+':-1',label+' ↓');}
   sortSelect.value=sort.key+':'+sort.direction;
   sortSelect.onchange=()=>{const [key,direction]=sortSelect.value.split(':');viewSort.set(config.keyId,{key,direction:Number(direction)});refresh().catch(e=>$('message').textContent=e.message);};
   sortLabel.append(sortSelect);wrap.append(sortLabel);
+  if(state.choicesOutdated)wrap.append(node('p','策略已更改，列表仍是上次检查的结果，下次检查后按新策略重新排序。','muted'));
   if(state.rankingBasis==='accountMultiplier')wrap.append(node('p','全部合格渠道的模型价格缺失，本轮按账号倍率从低到高选择；同倍率保留当前渠道。','muted'));
-  if(state.rankingBasis==='rate')wrap.append(node('p','按账号倍率从低到高选择；同倍率保留当前渠道。','muted'));
-  if(state.rankingBasis==='cacheHit')wrap.append(node('p','按指定模型的 1h 缓存命中率从高到低选择；同缓存率保留当前渠道，缓存数据缺失或过期的渠道会被排除。','muted'));
   for(const [key,label] of columns){const th=node('th'),button=node('button',label+(sort.key===key?(sort.direction===1?' ↑':' ↓'):''),'column-sort');button.onclick=()=>{viewSort.set(config.keyId,{key,direction:sort.key===key?-sort.direction:['score','success','stars'].includes(key)?-1:1});refresh().catch(e=>$('message').textContent=e.message);};th.append(button);header.append(th);}
-  header.append(node('th','消费名次'),node('th','平台告警'),node('th','操作'));head.append(header);table.append(head);const body=node('tbody');
+  header.append(node('th','平台告警'),node('th','操作'));head.append(header);table.append(head);const body=node('tbody');
   const choices=[...state.choices].sort((a,b)=>{const x=a[sort.key],y=b[sort.key];if(x==null)return y==null?0:1;if(y==null)return -1;return (typeof x==='number'?x-y:String(x).localeCompare(String(y)))*sort.direction;});
   const now=Date.now();
   for(const choice of choices){
@@ -176,7 +178,7 @@ function candidateTable(config,state){
     row.classList.toggle('current',choice.id===state.expectedGroupId);
     for(const [key,label,formatter] of columns){
       const value=key==='code'?`${choice.code} [${choice.id}]`:format(choice[key],formatter);
-      const td=node('td',value);
+      const td=key==='popularityRank'?candidateBadgeCells(choice,now)[0]:node('td',value);
 
       if(key==='cost' && choice.cost==null && choice.priceReason){
         td.append(node('div',choice.priceReason,'muted'));
@@ -186,7 +188,7 @@ function candidateTable(config,state){
       td.dataset.label=label;
       row.append(td);
     }
-    row.append(...candidateBadgeCells(choice,now));
+    row.append(candidateBadgeCells(choice,now)[1]);
     const cell=node('td');cell.dataset.label='操作';if(choice.id===state.expectedGroupId)cell.append(node('span','当前','badge'));else{const button=node('button','切换','quiet');button.setAttribute('aria-label',`切换到 ${choice.code}`);button.disabled=!!state.pending;button.onclick=()=>confirmSwitch(config,state,choice);cell.append(button);}row.append(cell);body.append(row);
   }
   table.append(body);wrap.append(table);return wrap;
@@ -216,6 +218,7 @@ async function refresh(){
     attachStrategyFields(defaultEditor,app.defaultStrategy);
     defaultEditor.elements.requireDetection.checked=app.defaultStrategy.requireDetection!==false;
     $('checkMinutes').value=app.checkMinutes||5;
+    $('autoOpenProviders').checked=app.autoOpenProviders===true;
     globalLoaded=true;
   }
   for(const keyId of strategyEditors.keys())if(!app.configs.some(c=>c.keyId===keyId))strategyEditors.delete(keyId);
@@ -251,6 +254,19 @@ async function refresh(){
       }
       box.append(details);
     }
+    const picker=node('div',null,'mode-switch');picker.setAttribute('role','group');picker.setAttribute('aria-label',`Key ${c.keyId} 的排序方式`);
+    for(const [mode,label] of [['balanced','综合排序'],['price','模型价格'],['weighted','自定义']]){
+      const button=node('button',label,'mode-switch-item');button.type='button';button.setAttribute('aria-pressed',String(c.strategy.mode===mode));button.disabled=!!s.pending;
+      button.onclick=()=>{
+        if(mode==='weighted')expandStrategy.add(c.keyId);
+        if(c.strategy.mode===mode){if(mode==='weighted')refresh().catch(()=>{});return;}
+        strategyEditors.delete(c.keyId);
+        act(async()=>{await send({type:'keyStrategy',keyId:c.keyId,strategy:{...c.strategy,mode}});if(!c.paused)await send({type:'check'});});
+      };
+      picker.append(button);
+    }
+    box.querySelector('.monitor-meta').after(picker);
+    if(expandStrategy.delete(c.keyId)&&!strategyEditors.has(c.keyId))strategyEditors.set(c.keyId,keyStrategyEditor(c));
     const controls=node('div',null,'monitor-controls');
     for(const [field,label,checked] of [['automatic','自动改组',c.automatic],['requireDetection','排除检测未通过',c.strategy.requireDetection!==false],['excludeWarnings','排除平台告警',c.excludeWarnings===true]]){
       const wrapper=node('label',null,'checkbox'),input=node('input');input.type='checkbox';input.checked=checked;input.disabled=!!s.pending;
@@ -261,13 +277,13 @@ async function refresh(){
     }
     const footer=node('div',null,'monitor-footer');
     const actions=node('div',null,'actions');
-    const adjust=node('button',strategyEditors.has(c.keyId)?'收起策略':'调整策略','quiet');
+    const adjust=node('button',strategyEditors.has(c.keyId)?'收起权重与规则':'权重与规则','quiet');
     adjust.setAttribute('aria-expanded',String(strategyEditors.has(c.keyId)));
     adjust.onclick=()=>{
       let editor=strategyEditors.get(c.keyId);
-      if(editor){strategyEditors.delete(c.keyId);editor.remove();adjust.textContent='调整策略';adjust.setAttribute('aria-expanded','false');return;}
+      if(editor){strategyEditors.delete(c.keyId);editor.remove();adjust.textContent='权重与规则';adjust.setAttribute('aria-expanded','false');return;}
       editor=keyStrategyEditor(c);strategyEditors.set(c.keyId,editor);box.append(editor);
-      adjust.textContent='收起策略';adjust.setAttribute('aria-expanded','true');
+      adjust.textContent='收起权重与规则';adjust.setAttribute('aria-expanded','true');
       editor.querySelector('[name=mode]:checked')?.focus();
     };
     actions.append(adjust);
@@ -293,7 +309,8 @@ async function act(fn){
 $('catalog').onclick=$('refreshCatalog').onclick=()=>act(async()=>{catalog=await send({type:'catalog'});appliedCatalogAt=catalog.at;});
 $('disconnect').onclick=()=>confirmAction('确认断开并暂停',['将断开平台连接并暂停全部监控。'],'确认断开',{type:'disconnect'});
 $('resetAccount').onclick=()=>confirmAction('确认清空账号绑定',['移除全部监控后，可清空保存的账号绑定并连接其他账号。'],'确认清空',{type:'resetAccount'});
+$('autoOpenProviders').onchange=event=>act(()=>send({type:'autoOpen',enabled:event.target.checked}));
 $('check').onclick=()=>act(()=>send({type:'check'}));
-defaultEditor.onsubmit=event=>{event.preventDefault();act(()=>send({type:'strategy',strategy:readEditor(defaultEditor,defaultEditor.elements.requireDetection.checked),checkMinutes:Number($('checkMinutes').value)}));};
+defaultEditor.onsubmit=event=>{event.preventDefault();act(()=>send({type:'strategy',strategy:readEditor(defaultEditor,defaultEditor.elements.requireDetection.checked,app.defaultStrategy),checkMinutes:Number($('checkMinutes').value)}));};
 refresh().then(()=>{if(connected&&!catalog.keys.length)$('refreshCatalog').click();}).catch(e=>$('message').textContent=e.message);
 setInterval(()=>{if(!document.querySelector('dialog[open]')&&!document.activeElement?.matches('input,select'))refresh().catch(()=>{});},20000);

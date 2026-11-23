@@ -1,6 +1,6 @@
 import {decide,platformPrice,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,DEFAULT_STRATEGY,INTERVAL} from './core.js';
-const ORIGIN='https://aihub.top', ALARM='aihub-check';
-const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:8,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
+const ORIGIN='https://aihub.top', ALARM='aihub-check', PROVIDERS_URL='https://aihub.top/providers', AUTO_OPEN_GAP=600000;
+const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:9,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
 let queue=Promise.resolve();
 const urgentPause=new Map();
 let disconnectRequested=false;
@@ -36,6 +36,18 @@ async function connectOpenTab(){
       if(typeof token==='string' && token.length>0 && token.length<16000){await chrome.storage.session.set({auth:'Bearer '+token});return;}
     }catch{}
   }
+}
+// Opt-in: when the site session is missing, open the providers page in the background so the next check can connect.
+async function openProvidersIfAllowed(app,error){
+  if(error?.message!=='AUTH' || app.autoOpenProviders!==true || typeof chrome.tabs?.create!=='function')return;
+  if(Date.now()-(app.lastAutoOpenAt||0)<AUTO_OPEN_GAP)return;
+  try{
+    const open=await bounded(chrome.tabs.query({url:'https://aihub.top/*'}),4000,'TAB_TIMEOUT');
+    app.lastAutoOpenAt=Date.now();
+    if(open.length)return;
+    await chrome.tabs.create({url:PROVIDERS_URL,active:false});
+    log(app,'无法连接平台，已在后台打开 AIHub 供应商页面，请确认已登录');
+  }catch{}
 }
 async function identity(app){
   const me=await api('/api/v1/auth/me');
@@ -159,6 +171,7 @@ async function check(){
     await save(app);
   }catch(e){
     app.lastError=errorText(e);
+    await openProvidersIfAllowed(app,e);
     // An interrupted/failed poll breaks consecutiveness.
     for(const s of Object.values(app.states)){s.candidate=null;s.count=0;}
     await notice(app,`read-${e.message}`,app.lastError);await save(app);
@@ -207,8 +220,12 @@ async function handle(message,pauseRequest,disconnectRequest){
     }catch{await notice(app,`pending-${c.keyId}`,`Key ${c.keyId} 手动切换结果待核实，请点击立即检查`);}
     await save(app);return {ok:true};
   }
+  if(message.type==='autoOpen'){
+    if(typeof message.enabled!=='boolean')throw new Error('FORMAT');
+    app.autoOpenProviders=message.enabled;await save(app);return {ok:true};
+  }
   if(message.type==='catalog'){
-    await connectedIdentity(app);
+    try{await connectedIdentity(app);}catch(e){await openProvidersIfAllowed(app,e);await save(app);throw e;}
     const [all,snapshot]=await Promise.all([keys(),authorizedSnapshot()]);app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);await save(app);
     return app.catalog;
   }
@@ -249,7 +266,10 @@ async function handle(message,pauseRequest,disconnectRequest){
     else if(message.field==='excludeWarnings' && typeof message.enabled==='boolean')c.excludeWarnings=message.enabled;
     else throw new Error('FORMAT');
     const state=app.states[c.keyId]||{};
+    // Keep the last candidate list visible until the next check re-ranks it.
+    const {choices,excluded,priceUnavailableChoices}=state;
     resetStrategyCheck(state,c.paused?'已暂停':'设置已更新，等待检查');
+    if(choices)Object.assign(state,{choices,excluded,priceUnavailableChoices,choicesOutdated:true});
     app.states[c.keyId]=state;
     log(app,`Key ${c.keyId} 设置已更新`);await save(app);return {ok:true};
   }

@@ -2,12 +2,27 @@ export const INTERVAL = 300000;
 // Usage profile for comparing prices: input tokens per output token, and the cache-read share of input.
 export const DEFAULT_USAGE=Object.freeze({inputRatio:3,cacheRate:80,measuredCache:true});
 export const DEFAULT_RULES=Object.freeze({minSuccess:0,minCacheHit:0,minSamples:0,maxLatency:0,maxPrice:0,maxRate:0,allowIds:Object.freeze([]),denyIds:Object.freeze([]),confirmRounds:1,cooldownMinutes:0,minImprovement:0});
-export const DEFAULT_STRATEGY = Object.freeze({mode:'price',weights:Object.freeze({price:70,latency:20,success:10}),requireDetection:true,rules:DEFAULT_RULES,usage:DEFAULT_USAGE});
+export const DEFAULT_STRATEGY = Object.freeze({mode:'balanced',weights:Object.freeze({price:70,latency:20,success:10,popularity:0,stars:0}),requireDetection:true,rules:DEFAULT_RULES,usage:DEFAULT_USAGE});
+// Balanced preset: success and latency are required; rating and spending rank count only when every candidate has them.
+export const BALANCED_WEIGHTS=Object.freeze({price:40,latency:15,success:25,popularity:10,stars:10});
+const PRICE_WEIGHTS=Object.freeze({price:100,latency:0,success:0,popularity:0,stars:0});
+const OPTIONAL_BALANCED=['stars','popularity'];
+export const STRATEGY_MODES=Object.freeze(['price','balanced','weighted']);
+// Weights shown in the editor for a mode; custom mode shows the key's own weights.
+export function presetWeights(mode,custom=DEFAULT_STRATEGY.weights){return {...(mode==='price'?PRICE_WEIGHTS:mode==='balanced'?BALANCED_WEIGHTS:custom)};}
+// Modes removed in schema 9 map to the closest remaining strategy.
+function upgradeLegacyMode(strategy){
+  if(!strategy)return strategy;
+  if(['rate','cacheHit'].includes(strategy.mode))return {...strategy,mode:'price'};
+  if(strategy.mode==='experience')return {...strategy,mode:'balanced'};
+  if(['latency','success'].includes(strategy.mode))return {...strategy,mode:'weighted',weights:{price:0,latency:0,success:0,popularity:0,stars:0,[strategy.mode]:100}};
+  return strategy;
+}
 export function validateStrategy(strategy) {
-  if (!strategy || !['price','rate','cacheHit','latency','success','weighted'].includes(strategy.mode)) throw new Error('排序方式无效');
+  if (!strategy || !STRATEGY_MODES.includes(strategy.mode)) throw new Error('排序方式无效');
   const weights={...DEFAULT_STRATEGY.weights,...strategy.weights};
-  if (!['price','latency','success'].every(k=>typeof weights[k]==='number' && Number.isFinite(weights[k]) && weights[k]>=0 && weights[k]<=100)) throw new Error('权重必须为 0 至 100 的数字');
-  if (strategy.mode==='weighted' && weights.price+weights.latency+weights.success<=0) throw new Error('请至少给一个因素设置正权重');
+  if (!['price','latency','success','popularity','stars'].every(k=>typeof weights[k]==='number' && Number.isFinite(weights[k]) && weights[k]>=0 && weights[k]<=100)) throw new Error('权重必须为 0 至 100 的数字');
+  if (strategy.mode==='weighted' && weights.price+weights.latency+weights.success+weights.popularity+weights.stars<=0) throw new Error('请至少给一个因素设置正权重');
   if(strategy.requireDetection!=null && typeof strategy.requireDetection!=='boolean')throw new Error('模型检测筛选设置无效');
   const rules={...DEFAULT_RULES,...strategy.rules};
   for(const k of ['minSuccess','minCacheHit','minSamples','maxLatency','maxPrice','maxRate','confirmRounds','cooldownMinutes','minImprovement'])if(typeof rules[k]!=='number'||!Number.isFinite(rules[k])||rules[k]<0)throw new Error('筛选和切换数值必须为非负数字');
@@ -17,7 +32,7 @@ export function validateStrategy(strategy) {
   if(typeof usage.inputRatio!=='number'||!Number.isFinite(usage.inputRatio)||usage.inputRatio<=0||usage.inputRatio>1000)throw new Error('输入输出比例须为大于 0、不超过 1000 的数字');
   if(typeof usage.cacheRate!=='number'||!Number.isFinite(usage.cacheRate)||usage.cacheRate<0||usage.cacheRate>100)throw new Error('缓存命中率假设须为 0–100');
   if(typeof usage.measuredCache!=='boolean')throw new Error('实测缓存率设置无效');
-  return {mode:strategy.mode,weights:{price:weights.price,latency:weights.latency,success:weights.success},requireDetection:strategy.requireDetection!==false,rules,usage:{inputRatio:usage.inputRatio,cacheRate:usage.cacheRate,measuredCache:usage.measuredCache}};
+  return {mode:strategy.mode,weights:{price:weights.price,latency:weights.latency,success:weights.success,popularity:weights.popularity,stars:weights.stars},requireDetection:strategy.requireDetection!==false,rules,usage:{inputRatio:usage.inputRatio,cacheRate:usage.cacheRate,measuredCache:usage.measuredCache}};
 }
 export function detectionInfo(group,model){
   const d=group.model_detection;
@@ -33,9 +48,11 @@ export function detectionInfo(group,model){
 }
 export function strategyLabel(strategy) {
   const s=validateStrategy(strategy);
-  if(s.mode!=='weighted')return {price:'模型价格优先',rate:'账号倍率优先',cacheHit:'缓存率更高优先',latency:'首响应更快优先',success:'成功率更高优先'}[s.mode];
+  if(s.mode==='price')return '模型价格优先';
+  if(s.mode==='balanced')return '综合排序';
   const total=Object.values(s.weights).reduce((a,b)=>a+b,0);
-  return `加权：模型价格 ${(s.weights.price/total*100).toFixed(1)}% · 延迟 ${(s.weights.latency/total*100).toFixed(1)}% · 成功率 ${(s.weights.success/total*100).toFixed(1)}%`;
+  const parts=[['price','模型价格'],['latency','延迟'],['success','成功率'],['popularity','消费排名'],['stars','用户评分']].filter(([k])=>s.weights[k]>0).map(([k,label])=>`${label} ${(s.weights[k]/total*100).toFixed(1)}%`);
+  return '自定义：'+parts.join(' · ');
 }
 const validPrice = x => typeof x === 'number' && Number.isFinite(x) && x >= 0;
 function modelCacheHit(summary,now){
@@ -64,12 +81,12 @@ export function platformPrice(group, model, usage=DEFAULT_USAGE, now=Date.now())
   return result.reason ? null : result;
 }
 export function migrateApp(app) {
-  if (app.schemaVersion === 8) return false;
+  if (app.schemaVersion === 9) return false;
   const previousVersion=app.schemaVersion;
-  app.defaultStrategy=validateStrategy(app.defaultStrategy||DEFAULT_STRATEGY);
+  app.defaultStrategy=validateStrategy(upgradeLegacyMode(app.defaultStrategy)||DEFAULT_STRATEGY);
   app.checkMinutes=app.checkMinutes||5;
-  for(const c of app.configs)c.strategy=validateStrategy(c.strategy||app.defaultStrategy);
-  if(previousVersion!==7){
+  for(const c of app.configs)c.strategy=validateStrategy(upgradeLegacyMode(c.strategy)||app.defaultStrategy);
+  if(!(previousVersion>=7)){
     delete app.pricing;
     for(const c of app.configs){
       delete c.profile;
@@ -78,7 +95,7 @@ export function migrateApp(app) {
     }
     for(const s of Object.values(app.states))resetStrategyCheck(s,'排序策略已更新，等待重新检查');
   }
-  app.schemaVersion=8;
+  app.schemaVersion=9;
   return true;
 }
 export function resetStrategyCheck(state,status){
@@ -120,7 +137,8 @@ export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) 
   const samples=validPrice(summary?.sample_count)&&Number.isInteger(summary.sample_count)?summary.sample_count:null;
   const latency=samples>0 && validPrice(summary.user_latency_ms) ? summary.user_latency_ms : null;
   const success=samples>0 && validPrice(summary.success_rate) && summary.success_rate<=1 ? summary.success_rate : null;
-  const metrics={price:metric?.cost??null,rate:validPrice(group.rate_multiplier)?group.rate_multiplier:null,cacheHit,latency,success};
+  const pop=providerBadgeDetails(channelSummary(group).hall,now)?.popularity,popularity=pop?pop.rank/pop.groups:null,stars=validPrice(group.reputation?.stars)?group.reputation.stars:null;
+  const metrics={price:metric?.cost??null,rate:validPrice(group.rate_multiplier)?group.rate_multiplier:null,cacheHit,latency,success,popularity,popularityRank:pop?pop.rank:null,stars};
   const missingPrice={reason:metric.reason,priceUnavailable:true,channelPrice:model.price};
   if(rules.minSamples>0 && (samples===null||samples<rules.minSamples))return {reason:'样本数低于下限'};
   if(rules.minSuccess>0 && (success===null || success*100<rules.minSuccess))return {reason:'成功率低于下限或未知'};
@@ -128,9 +146,9 @@ export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) 
   if(rules.maxLatency>0 && (latency===null || latency>rules.maxLatency))return {reason:'延迟超过上限或未知'};
   if(rules.maxPrice>0 && metrics.price===null)return missingPrice;
   if(rules.maxPrice>0 && metrics.price>rules.maxPrice)return {reason:'模型价格超过上限'};
-  const required=strategy.mode==='weighted' ? Object.keys(strategy.weights).filter(k=>strategy.weights[k]>0) : [strategy.mode];
+  const required=strategy.mode==='weighted' ? Object.keys(strategy.weights).filter(k=>strategy.weights[k]>0) : strategy.mode==='balanced' ? ['success','latency'] : ['price'];
   const missing=required.find(k=>k!=='price' && metrics[k]===null);
-  if(missing)return {reason:{rate:'账号倍率无效或未知',cacheHit:'指定模型缓存率未知或数据未就绪',latency:'指定模型首响应延迟缺失或无样本',success:'指定模型成功率缺失或无样本'}[missing]};
+  if(missing)return {reason:{rate:'账号倍率无效或未知',cacheHit:'指定模型缓存率未知或数据未就绪',latency:'指定模型首响应延迟缺失或无样本',success:'指定模型成功率缺失或无样本',popularity:'消费排名未知或已过期',stars:'用户评分缺失'}[missing]};
   return {cost:metrics.price,latency,success,cacheHit,metrics,detection:detection.label,
     costCacheHit:metric.costCacheHit,costCacheMeasured:metric.costCacheMeasured,
     priceReason:metric.reason,channelPrice:metric.reason?model.price:undefined
@@ -144,16 +162,16 @@ export function rankChoices(choices,strategy) {
     return choices.map(c=>({...c,score:validPrice(c.group.rate_multiplier)?(max===min?100:(max-c.group.rate_multiplier)/(max-min)*100):null}))
       .sort((a,b)=>(b.score??-1)-(a.score??-1) || a.group.group_id-b.group.group_id);
   }
-  const weights=s.mode==='weighted'?s.weights:{[s.mode]:1};
+  const weights=s.mode==='weighted'?s.weights:s.mode==='balanced'?BALANCED_WEIGHTS:{price:1};
   const priced=weights.price>0?choices.filter(c=>c.metrics.price!==null):[];
   const comparable=priced.length?priced:choices;
-  const keys=Object.keys(weights).filter(k=>weights[k]>0 && (k!=='price' || priced.length));
+  const keys=Object.keys(weights).filter(k=>weights[k]>0 && (k!=='price' || priced.length) && !(s.mode==='balanced' && OPTIONAL_BALANCED.includes(k) && comparable.some(c=>c.metrics[k]===null)));
   const total=keys.reduce((v,k)=>v+weights[k],0);
   const bounds=Object.fromEntries(keys.map(k=>[k,{min:Math.min(...comparable.map(c=>c.metrics[k])),max:Math.max(...comparable.map(c=>c.metrics[k]))}]));
   return choices.map(c=>{
     if(priced.length && c.metrics.price===null)return {...c,score:null};
     let score=0;
-    for(const k of keys){const {min,max}=bounds[k];const normalized=max===min?1:['success','cacheHit'].includes(k)?(c.metrics[k]-min)/(max-min):(max-c.metrics[k])/(max-min);score+=normalized*weights[k]/total*100;}
+    for(const k of keys){const {min,max}=bounds[k];const normalized=max===min?1:['success','cacheHit','stars'].includes(k)?(c.metrics[k]-min)/(max-min):(max-c.metrics[k])/(max-min);score+=normalized*weights[k]/total*100;}
     return {...c,score};
   }).sort((a,b)=>(b.score??-1)-(a.score??-1) || a.group.group_id-b.group.group_id);
 }
@@ -201,6 +219,7 @@ export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),g
   const strategy=validateStrategy(config.strategy||globalStrategy),signature=JSON.stringify(strategy);
   if(state.strategySignature && state.strategySignature!==signature)state={...state,candidate:null,count:0,observedAt:undefined};
   const next={...state,strategySignature:signature};
+  delete next.choicesOutdated;
   const reset=(status)=>({state:{...next,candidate:null,count:0,status},target:null});
   if (config.paused) return reset('已暂停');
   if (state.pending) return reset('等待核实上次切换');
@@ -215,20 +234,20 @@ export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),g
   const rateFallback=strategy.mode==='price' && choices.length>0 && choices.every(x=>x.cost===null);
   next.rankingBasis=rateFallback?'accountMultiplier':strategy.mode;
   if(state.rankingBasis!==next.rankingBasis)state={...state,candidate:null,count:0,observedAt:undefined};
-  next.choices=choices.map(x=>({...channelSummary(x.group),cost:x.cost,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection,
+  next.choices=choices.map(x=>({...channelSummary(x.group),cost:x.cost,rawMultiplier:x.group.public_rate_multiplier??x.group.rate_multiplier,accountMultiplier:x.group.rate_multiplier,latency:x.latency,success:x.success,score:x.score,popularityRank:x.metrics.popularityRank,stars:validPrice(x.group.reputation?.stars)?x.group.reputation.stars:null,detection:x.detection,
     cacheHit:x.cacheHit,costCacheHit:x.costCacheHit,costCacheMeasured:x.costCacheMeasured,priceReason:x.priceReason,channelPrice:x.channelPrice
   }));
   if (!choices.length) return {...reset('没有合格分组，保留当前'),notice:'no-candidate'};
   const current=choices.find(x=>x.group.group_id===currentGroupId), best=choices[0];
-  const usesPrice=strategy.mode==='price' || (strategy.mode==='weighted' && strategy.weights.price>0);
+  const usesPrice=strategy.mode!=='weighted' || strategy.weights.price>0;
   const basis=rateFallback?'全部模型价格缺失，按账号倍率：':'';
   if(rateFallback && best.score===null)return reset('全部模型价格缺失，账号倍率也不可比较，保留当前');
   if (current?.cost===null && usesPrice && !rateFallback) return reset('当前分组可用，模型价格暂不可比较');
   if(rateFallback && current && current.score===null)return reset('全部模型价格缺失，当前账号倍率未知，保留当前');
-  if (current && current.score>=best.score-1e-9) return reset(rateFallback?'全部模型价格缺失，当前账号倍率最低（同倍率不切）':strategy.mode==='rate'?'当前账号倍率最低（同倍率不切）':'当前分组已是策略最优（同分不切）');
+  if (current && current.score>=best.score-1e-9) return reset(rateFallback?'全部模型价格缺失，当前账号倍率最低（同倍率不切）':'当前分组已是策略最优（同分不切）');
   if (!current) return {state:{...next,candidate:null,count:0,status:basis+'当前分组不合格，准备切换'},target:best.group.group_id};
   if(state.lastSwitchAt && now-state.lastSwitchAt<strategy.rules.cooldownMinutes*60000)return reset('切换冷却中');
-  const improvement=rateFallback?(current.group.rate_multiplier-best.group.rate_multiplier)/Math.max(current.group.rate_multiplier,1e-12)*100:strategy.mode==='weighted'?best.score-current.score:['success','cacheHit'].includes(strategy.mode)?(best.metrics[strategy.mode]-current.metrics[strategy.mode])/Math.max(current.metrics[strategy.mode],1e-12)*100:(current.metrics[strategy.mode]-best.metrics[strategy.mode])/Math.max(current.metrics[strategy.mode],1e-12)*100;
+  const improvement=rateFallback?(current.group.rate_multiplier-best.group.rate_multiplier)/Math.max(current.group.rate_multiplier,1e-12)*100:strategy.mode!=='price'?best.score-current.score:(current.metrics.price-best.metrics.price)/Math.max(current.metrics.price,1e-12)*100;
   if(improvement+1e-9<strategy.rules.minImprovement)return reset('改善幅度未达到要求');
   // Manual checks cannot turn one observation into two consecutive 5-minute observations.
   const consecutive=state.candidate===best.group.group_id && now-state.observedAt>=intervalMs-1000 && now-state.observedAt<=intervalMs*1.6;
