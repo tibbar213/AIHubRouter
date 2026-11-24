@@ -217,6 +217,24 @@ test('scheduled checks reconnect from an open site tab after session loss',async
   chrome.tabs.query=async()=>[{id:3}];chrome.scripting.executeScript=async()=>[{result:'RENEWED_TEST_SESSION'}];
   await b.send({type:'check'});assert.equal(b.local.app.lastError,null);assert.equal(b.local.app.notices['read-AUTH'],undefined);assert.equal(b.session.auth,'Bearer RENEWED_TEST_SESSION');assert.equal(b.requests.filter(x=>x.method==='PUT').length,0);
 });
+test('manual check reports the real error instead of success when the platform is unreachable',async()=>{
+  const b=await boot({auth:false,automatic:false});
+  const manual=(await b.send({type:'check',manual:true})).result;
+  assert.equal(manual.ok,false);assert.match(manual.error,/登录已失效/);
+  // 定时检查仍然只记录错误、返回成功，不打扰用户。
+  const scheduled=(await b.send({type:'check'})).result;
+  assert.equal(scheduled.ok,true);
+});
+test('manual check connects to the platform even when no monitor is running, scheduled check does not',async()=>{
+  const b=await boot({automatic:false});b.local.app.configs[0].paused=true;
+  await b.send({type:'check'});
+  assert.equal(b.requests.length,0);
+  const manual=(await b.send({type:'check',manual:true})).result;
+  assert.equal(manual.ok,true);assert.match(manual.note,/没有运行中的监控/);
+  assert.ok(b.requests.some(r=>r.path==='/api/v1/auth/me'));
+  assert.equal(b.requests.filter(r=>r.method==='PUT').length,0);
+  assert.equal(b.local.app.lastError,null);
+});
 test('expired cached credentials are replaced once and identity is rechecked',async()=>{
   const b=await boot({automatic:false}),original=globalThis.fetch;let rejected=false;
   globalThis.fetch=async(url,options)=>{if(new URL(url).pathname==='/api/v1/auth/me'&&!rejected){rejected=true;return {status:401,ok:false};}return original(url,options);};

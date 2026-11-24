@@ -45,15 +45,18 @@ try{
   await template.locator('[name=minCacheHit]').fill('80');
   await template.locator('[name=minSamples]').fill('10');
   await template.locator('[name=confirmRounds]').fill('3');
-  await template.locator('[name=inputRatio]').fill('15');await template.locator('[name=cacheRate]').fill('80');
   await page.getByRole('button',{name:'保存默认策略与检查间隔',exact:true}).click();
   await page.getByText('已完成',{exact:true}).waitFor();
+  const usageForm=page.locator('#usageForm');
+  await usageForm.locator('[name=inputRatio]').fill('15');await usageForm.locator('[name=cacheRate]').fill('80');
+  await page.getByRole('button',{name:'保存价格计算',exact:true}).click();
+  await page.getByText('已完成',{exact:true}).waitFor();
   assert.equal((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).defaultStrategy.weights.price,60);
-  assert.deepEqual((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).defaultStrategy.usage,{inputRatio:15,cacheRate:80,measuredCache:true});
+  assert.deepEqual((await worker.evaluate(async()=>(await chrome.storage.local.get('app')).app)).usage,{inputRatio:15,cacheRate:80,measuredCache:true});
   await page.screenshot({path:join(profile,'settings-preview.png'),fullPage:true});
   await page.getByRole('button',{name:'监控0',exact:true}).click();
   await page.getByRole('button',{name:'立即检查',exact:true}).click();
-  await page.getByText('已完成',{exact:true}).waitFor();
+  await page.getByText('网站登录已失效',{exact:false}).first().waitFor();
   // Synthetic test data and requests are injected only into this isolated browser profile.
   await worker.evaluate(async()=>{
     await chrome.storage.session.set({auth:'Bearer TEST_ONLY_FAKE_SESSION'});

@@ -1,8 +1,8 @@
 export const INTERVAL = 300000;
 // Usage profile for comparing prices: input tokens per output token, and the cache-read share of input.
-export const DEFAULT_USAGE=Object.freeze({inputRatio:3,cacheRate:80,measuredCache:true});
+export const DEFAULT_USAGE=Object.freeze({inputRatio:3,cacheRate:0,measuredCache:true});
 export const DEFAULT_RULES=Object.freeze({minSuccess:0,minCacheHit:0,minSamples:0,maxLatency:0,maxPrice:0,maxRate:0,allowIds:Object.freeze([]),denyIds:Object.freeze([]),confirmRounds:1,cooldownMinutes:0,minImprovement:0});
-export const DEFAULT_STRATEGY = Object.freeze({mode:'balanced',weights:Object.freeze({price:70,latency:20,success:10,popularity:0,stars:0}),requireDetection:true,rules:DEFAULT_RULES,usage:DEFAULT_USAGE});
+export const DEFAULT_STRATEGY = Object.freeze({mode:'balanced',weights:Object.freeze({price:70,latency:20,success:10,popularity:0,stars:0}),requireDetection:true,rules:DEFAULT_RULES});
 // Balanced preset: success and latency are required; rating and spending rank count only when every candidate has them.
 export const BALANCED_WEIGHTS=Object.freeze({price:40,latency:15,success:25,popularity:10,stars:10});
 const PRICE_WEIGHTS=Object.freeze({price:100,latency:0,success:0,popularity:0,stars:0});
@@ -18,6 +18,13 @@ function upgradeLegacyMode(strategy){
   if(['latency','success'].includes(strategy.mode))return {...strategy,mode:'weighted',weights:{price:0,latency:0,success:0,popularity:0,stars:0,[strategy.mode]:100}};
   return strategy;
 }
+export function validateUsage(usage){
+  usage={...DEFAULT_USAGE,...usage};
+  if(typeof usage.inputRatio!=='number'||!Number.isFinite(usage.inputRatio)||usage.inputRatio<=0||usage.inputRatio>1000)throw new Error('输入输出比例须为大于 0、不超过 1000 的数字');
+  if(typeof usage.cacheRate!=='number'||!Number.isFinite(usage.cacheRate)||usage.cacheRate<0||usage.cacheRate>100)throw new Error('缓存命中率假设须为 0–100');
+  if(typeof usage.measuredCache!=='boolean')throw new Error('实测缓存率设置无效');
+  return {inputRatio:usage.inputRatio,cacheRate:usage.cacheRate,measuredCache:usage.measuredCache};
+}
 export function validateStrategy(strategy) {
   if (!strategy || !STRATEGY_MODES.includes(strategy.mode)) throw new Error('排序方式无效');
   const weights={...DEFAULT_STRATEGY.weights,...strategy.weights};
@@ -28,11 +35,7 @@ export function validateStrategy(strategy) {
   for(const k of ['minSuccess','minCacheHit','minSamples','maxLatency','maxPrice','maxRate','confirmRounds','cooldownMinutes','minImprovement'])if(typeof rules[k]!=='number'||!Number.isFinite(rules[k])||rules[k]<0)throw new Error('筛选和切换数值必须为非负数字');
   if(rules.minSuccess>100||rules.minCacheHit>100||rules.minImprovement>100||!Number.isInteger(rules.confirmRounds)||rules.confirmRounds<1||rules.confirmRounds>6||!Number.isInteger(rules.minSamples)||rules.cooldownMinutes>1440)throw new Error('成功率/缓存率/改善幅度应为0–100，确认轮数1–6，样本数为整数，冷却不超过1440分钟');
   for(const k of ['allowIds','denyIds']){if(!Array.isArray(rules[k])||rules[k].length>1000||!rules[k].every(x=>Number.isSafeInteger(x)&&x>0))throw new Error('渠道名单请填写正整数分组 ID');rules[k]=[...new Set(rules[k])];}
-  const usage={...DEFAULT_USAGE,...strategy.usage};
-  if(typeof usage.inputRatio!=='number'||!Number.isFinite(usage.inputRatio)||usage.inputRatio<=0||usage.inputRatio>1000)throw new Error('输入输出比例须为大于 0、不超过 1000 的数字');
-  if(typeof usage.cacheRate!=='number'||!Number.isFinite(usage.cacheRate)||usage.cacheRate<0||usage.cacheRate>100)throw new Error('缓存命中率假设须为 0–100');
-  if(typeof usage.measuredCache!=='boolean')throw new Error('实测缓存率设置无效');
-  return {mode:strategy.mode,weights:{price:weights.price,latency:weights.latency,success:weights.success,popularity:weights.popularity,stars:weights.stars},requireDetection:strategy.requireDetection!==false,rules,usage:{inputRatio:usage.inputRatio,cacheRate:usage.cacheRate,measuredCache:usage.measuredCache}};
+  return {mode:strategy.mode,weights:{price:weights.price,latency:weights.latency,success:weights.success,popularity:weights.popularity,stars:weights.stars},requireDetection:strategy.requireDetection!==false,rules};
 }
 export function detectionInfo(group,model){
   const d=group.model_detection;
@@ -57,8 +60,9 @@ export function strategyLabel(strategy) {
 const validPrice = x => typeof x === 'number' && Number.isFinite(x) && x >= 0;
 function modelCacheHit(summary,now){
   const cache=summary?.range_cache,refreshed=Date.parse(cache?.refreshed_at);
-  return cache?.ready===true && cache.coverage_complete===true && cache.stale===false &&
-    Number.isSafeInteger(cache.usage_records) && cache.usage_records>0 &&
+  // 与供应商大厅单模型视图一致：只要求 ready、未过期且命中率有效。
+  // coverage_complete 只表示历史覆盖不完整（大厅仅在悬停提示里说明），不再作为必要条件。
+  return cache?.ready===true && cache.stale===false &&
     Number.isFinite(refreshed) && now-refreshed<=INTERVAL && refreshed<=now+60000 &&
     validPrice(cache.cache_hit_rate) && cache.cache_hit_rate<=1 ? cache.cache_hit_rate : null;
 }
@@ -77,13 +81,15 @@ function priceAssessment(price, rateMultiplier, usage=DEFAULT_USAGE, measuredHit
 }
 export function platformPrice(group, model, usage=DEFAULT_USAGE, now=Date.now()) {
   const price = group?.group_models?.find(entry=>entry.model===model)?.price;
-  const result = priceAssessment(price, group?.rate_multiplier, validateStrategy({mode:'price',usage}).usage, modelCacheHit(group?.summary_models?.[model],now));
+  const result = priceAssessment(price, group?.rate_multiplier, validateUsage(usage), modelCacheHit(group?.summary_models?.[model],now));
   return result.reason ? null : result;
 }
 export function migrateApp(app) {
-  if (app.schemaVersion === 9) return false;
+  if (app.schemaVersion === 10) return false;
   const previousVersion=app.schemaVersion;
-  app.defaultStrategy=validateStrategy(upgradeLegacyMode(app.defaultStrategy)||DEFAULT_STRATEGY);
+  const previous=upgradeLegacyMode(app.defaultStrategy);
+  app.usage=validateUsage(app.usage||previous?.usage||app.configs.find(c=>c.strategy?.usage)?.strategy.usage);
+  app.defaultStrategy=validateStrategy(previous||DEFAULT_STRATEGY);
   app.checkMinutes=app.checkMinutes||5;
   for(const c of app.configs){
     // Percent thresholds become score gaps for weighted mode; stop auto switching until the user reviews it.
@@ -103,7 +109,7 @@ export function migrateApp(app) {
     }
     for(const s of Object.values(app.states))resetStrategyCheck(s,'排序策略已更新，等待重新检查');
   }
-  app.schemaVersion=9;
+  app.schemaVersion=10;
   return true;
 }
 export function resetStrategyCheck(state,status){
@@ -113,8 +119,9 @@ export function resetStrategyCheck(state,status){
   delete state.excluded; delete state.rankingBasis;
   state.status=state.pending?'等待核实上次切换':status;
 }
-export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) {
+export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY, usage=DEFAULT_USAGE) {
   strategy=validateStrategy(strategy);
+  usage=validateUsage(usage);
   const rules=strategy.rules;
   const model=group?.group_models?.find(x=>x.model===config.model);
   if (!model) return {reason:'指定模型未列出'};
@@ -141,7 +148,7 @@ export function assess(group, config, snapshot, now, strategy=DEFAULT_STRATEGY) 
   if (group.subscription_type!=='standard') return {reason:'非按量分组'};
   const summary=group.summary_models?.[config.model];
   const cacheHit=modelCacheHit(summary,now);
-  const metric=priceAssessment(model.price,group.rate_multiplier,strategy.usage,cacheHit);
+  const metric=priceAssessment(model.price,group.rate_multiplier,usage,cacheHit);
   const samples=validPrice(summary?.sample_count)&&Number.isInteger(summary.sample_count)?summary.sample_count:null;
   const latency=samples>0 && validPrice(summary.user_latency_ms) ? summary.user_latency_ms : null;
   const success=samples>0 && validPrice(summary.success_rate) && summary.success_rate<=1 ? summary.success_rate : null;
@@ -223,8 +230,8 @@ function channelSummary(group) {
     hall:group.badges?{badges:group.badges,expiresAt:group.badges_expires_at}:null
   };
 }
-export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),globalStrategy=DEFAULT_STRATEGY,intervalMs=INTERVAL}) {
-  const strategy=validateStrategy(config.strategy||globalStrategy),signature=JSON.stringify(strategy);
+export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),globalStrategy=DEFAULT_STRATEGY,usage=DEFAULT_USAGE,intervalMs=INTERVAL}) {
+  const strategy=validateStrategy(config.strategy||globalStrategy),signature=JSON.stringify([strategy,validateUsage(usage)]);
   if(state.strategySignature && state.strategySignature!==signature)state={...state,candidate:null,count:0,observedAt:undefined};
   const next={...state,strategySignature:signature};
   delete next.choicesOutdated;
@@ -233,7 +240,7 @@ export function decide({config,state={},currentGroupId,snapshot,now=Date.now(),g
   if (state.pending) return reset('等待核实上次切换');
   if (state.expectedGroupId!=null && state.expectedGroupId!==currentGroupId) return {target:null,externalChange:true,state:{...next,...(state.choicesOutdated?{choicesOutdated:true}:{}),expectedGroupId:currentGroupId,observedGroupId:undefined,candidate:null,count:0,observedAt:undefined,status:'检测到分组变化，已更新并等待下轮检查'}};
   next.expectedGroupId=currentGroupId;
-  const assessed=(snapshot.items||[]).filter(g=>g?.group_models?.some(m=>m.model===config.model)).map(g=>({group:g,...assess(g,config,snapshot,now,strategy)}));
+  const assessed=(snapshot.items||[]).filter(g=>g?.group_models?.some(m=>m.model===config.model)).map(g=>({group:g,...assess(g,config,snapshot,now,strategy,usage)}));
   next.excluded=Object.fromEntries([...new Set(assessed.filter(x=>x.reason).map(x=>x.reason))].map(reason=>[reason,assessed.filter(x=>x.reason===reason).length]));
   next.priceUnavailableChoices=assessed.filter(x=>x.priceUnavailable).map(x=>({
     ...channelSummary(x.group),reason:x.reason,channelPrice:x.channelPrice

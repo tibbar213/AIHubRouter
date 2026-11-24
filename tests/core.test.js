@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {platformPrice,migrateApp,assess,decide,reconcilePending,INTERVAL,validateStrategy,DEFAULT_STRATEGY,providerBadgeDetails} from '../extension/core.js';
+import {platformPrice,migrateApp,assess,decide,reconcilePending,INTERVAL,validateStrategy,validateUsage,DEFAULT_STRATEGY,providerBadgeDetails} from '../extension/core.js';
 const now=Date.parse('2026-10-30T05:00:00Z');
 const config={keyId:1,model:'test-model'};
 function group(id,cost=1,platform='openai'){return {group_id:id,code:`G${id}`,platform,rate_multiplier:1,bindable:true,available:true,probe_state:'enabled',probe_expires_at:new Date(now+INTERVAL*10).toISOString(),subscription_type:'standard',model_detection:{model:'test-model',status:'passed',applicable:true,execution_complete:true},group_models:[{model:'test-model',price:{input_per_million:cost,output_per_million:cost}}],summary_models:{'test-model':{range_cache:{ready:true,stale:false}}},model_cards:[{model:'test-model',probe_state:'enabled',health:'healthy',health_expires_at:new Date(now+INTERVAL*10).toISOString()}]};}
@@ -22,8 +22,8 @@ test('model price blends input and output by the default 3:1 profile and applies
   assert.deepEqual(platformPrice(g,'test-model',{cacheRate:0}),{cost:2,costCacheHit:0,costCacheMeasured:false});
   assert.equal(platformPrice(g,'another-model').cost,4);
   assert.equal(platformPrice(g,'different-model'),null);
-  assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:1.99},usage:{cacheRate:0}}}).state.excluded['模型价格超过上限'],1);
-  assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:2},usage:{cacheRate:0}}}).state.choices[0].cost,2);
+  assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:1.99}},usage:{cacheRate:0}}).state.excluded['模型价格超过上限'],1);
+  assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{maxPrice:2}},usage:{cacheRate:0}}).state.choices[0].cost,2);
   g.rate_multiplier=NaN;
   assert.equal(assess(g,config,snapshot([g]),now,{mode:'price'}).priceReason,'账号倍率无效，无法计算模型价格');
 });
@@ -161,7 +161,7 @@ test('rate fallback never invents rates or bypasses price caps and resets when p
 });
 test('migration removes old formula settings, resets observations and preserves pending writes and opt-in',()=>{
   const app={configs:[{keyId:1,profile:{ratio:15},automatic:true,paused:true}],pricing:{verified:true},states:{1:{expectedGroupId:3,pending:{from:3,to:4},candidate:4,count:2,choices:[{cost:99}]} }};
-  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,9);
+  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,10);
   assert.equal(app.pricing,undefined);assert.equal(app.configs[0].profile,undefined);
   assert.equal(app.configs[0].automatic,true);assert.equal(app.configs[0].paused,true);
   assert.equal(app.states[1].count,0);assert.equal(app.states[1].choices,undefined);
@@ -362,11 +362,18 @@ test('minimum model cache hit rate filters before ranking across strategies',()=
   other.summary_models[config.model].range_cache=cache(.9);
   current.summary_models[config.model].range_cache=cache(.79);
   assert.equal(run([current,other],{},now,{globalStrategy:{mode:'price',rules:{minCacheHit:80,cooldownMinutes:60}}}).target,2);
-  for(const mutate of [c=>c.cache_hit_rate=null,c=>c.cache_hit_rate=1.1,c=>c.cache_hit_rate='0.9',c=>c.ready=false,c=>c.stale=true,c=>c.coverage_complete=false,c=>c.usage_records=0,c=>c.refreshed_at=new Date(now-INTERVAL-1).toISOString(),c=>c.refreshed_at=new Date(now+60001).toISOString()]){
+  for(const mutate of [c=>c.cache_hit_rate=null,c=>c.cache_hit_rate=1.1,c=>c.cache_hit_rate='0.9',c=>c.ready=false,c=>c.stale=true,c=>c.refreshed_at=new Date(now-INTERVAL-1).toISOString(),c=>c.refreshed_at=new Date(now+60001).toISOString()]){
     const g=group(2,.1);g.cache_hit_rate=1;g.summary_models[config.model].range_cache=cache(.9);
     mutate(g.summary_models[config.model].range_cache);
     assert.equal(run([g],{},now,{globalStrategy:{mode:'price',rules:{minCacheHit:80}}}).target,null);
     assert.equal(run([g],{},now,{globalStrategy:{mode:'price'}}).target,2);
+  }
+  // 与供应商大厅一致：覆盖不完整或样本数为 0，只要 ready 且命中率有效，缓存率仍然采用。
+  for(const mutate of [c=>c.coverage_complete=false,c=>c.usage_records=0,c=>delete c.coverage_complete]){
+    const g=group(2,.1);g.summary_models[config.model].range_cache=cache(.9);
+    mutate(g.summary_models[config.model].range_cache);
+    const result=run([g],{},now,{globalStrategy:{mode:'price',rules:{minCacheHit:80}}});
+    assert.equal(result.target,2);assert.equal(result.state.choices[0].cacheHit,.9);
   }
   for(const value of [-1,101,NaN,Infinity,'80'])assert.throws(()=>validateStrategy({mode:'price',rules:{minCacheHit:value}}));
   assert.equal(validateStrategy({mode:'price'}).rules.minCacheHit,0);
@@ -394,8 +401,10 @@ test('cache reads use the cache price, by assumed or measured hit rate and per-k
   const g=group(1);g.group_models[0].price={input_per_million:4,cache_input_per_million:.4,output_per_million:20};
   // No cache data: 3:1 profile, 0% assumed hit -> (3*4+20)/4 = 8.
   assert.equal(platformPrice(g,'test-model',{cacheRate:0}).cost,8);
-  // Default 80% assumed hit: input = .2*4+.8*.4 = 1.12 -> (3*1.12+20)/4 = 5.84.
-  assert.ok(Math.abs(platformPrice(g,'test-model').cost-5.84)<1e-9);
+  // Default is 0% assumed hit (unknown cache counts as a miss) -> 8.
+  assert.equal(platformPrice(g,'test-model').cost,8);
+  // 80% assumed hit: input = .2*4+.8*.4 = 1.12 -> (3*1.12+20)/4 = 5.84.
+  assert.ok(Math.abs(platformPrice(g,'test-model',{cacheRate:80}).cost-5.84)<1e-9);
   // 75% assumed hit: input = .25*4+.75*.4 = 1.3 -> (3*1.3+20)/4 = 5.975.
   assert.ok(Math.abs(platformPrice(g,'test-model',{cacheRate:75}).cost-5.975)<1e-9);
   // 15:1 agent profile with 80% assumed hit: input = .2*4+.8*.4 = 1.12 -> (15*1.12+20)/16 = 2.3.
@@ -413,13 +422,13 @@ test('cheaper cache price can win even with a higher input price',()=>{
   const a=group(1),b=group(2);
   a.group_models[0].price={input_per_million:2,cache_input_per_million:1,output_per_million:10};
   b.group_models[0].price={input_per_million:3,cache_input_per_million:.1,output_per_million:10};
-  const strategy=s=>({mode:'price',rules:{confirmRounds:1},usage:s});
-  assert.equal(run([a,b],{},now,{globalStrategy:strategy({cacheRate:0,measuredCache:false})}).state.choices[0].id,1);
-  assert.equal(run([a,b],{},now,{globalStrategy:strategy({inputRatio:15,cacheRate:80,measuredCache:false})}).state.choices[0].id,2);
+  assert.equal(run([a,b],{},now,{globalStrategy:{mode:'price',rules:{confirmRounds:1}},usage:{cacheRate:0,measuredCache:false}}).state.choices[0].id,1);
+  assert.equal(run([a,b],{},now,{globalStrategy:{mode:'price',rules:{confirmRounds:1}},usage:{inputRatio:15,cacheRate:80,measuredCache:false}}).state.choices[0].id,2);
 });
-test('usage profile is validated',()=>{
-  for(const usage of [{inputRatio:0},{inputRatio:-1},{inputRatio:'3'},{cacheRate:101},{cacheRate:-1},{measuredCache:'yes'}])assert.throws(()=>validateStrategy({mode:'price',usage}));
-  assert.deepEqual(validateStrategy({mode:'price'}).usage,{inputRatio:3,cacheRate:80,measuredCache:true});
+test('usage profile is validated and a strategy no longer carries one',()=>{
+  for(const usage of [{inputRatio:0},{inputRatio:-1},{inputRatio:'3'},{cacheRate:101},{cacheRate:-1},{measuredCache:'yes'}])assert.throws(()=>validateUsage(usage));
+  assert.deepEqual(validateUsage(),{inputRatio:3,cacheRate:0,measuredCache:true});
+  assert.equal(validateStrategy({mode:'price',usage:{inputRatio:99}}).usage,undefined);
 });
 
 test('consumption rank and user rating weights drive scoring and exclude channels without data',()=>{
@@ -453,13 +462,23 @@ test('balanced preset blends price, quality, rating and rank; optional data neve
 });
 test('schema 8 maps removed strategies to the closest remaining one and keeps observations',()=>{
   const app={schemaVersion:8,defaultStrategy:{mode:'cacheHit'},configs:[{keyId:1,strategy:{mode:'rate',rules:{minCacheHit:80}}},{keyId:2,strategy:{mode:'latency'}},{keyId:3,strategy:{mode:'experience'}},{keyId:4,strategy:{mode:'weighted',weights:{price:1}}}],states:{1:{candidate:2,count:1}}};
-  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,9);
+  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,10);
   assert.equal(app.defaultStrategy.mode,'price');
   assert.deepEqual(app.configs.map(x=>x.strategy.mode),['price','weighted','balanced','weighted']);
   assert.equal(app.configs[0].strategy.rules.minCacheHit,80);
   assert.equal(app.configs[1].strategy.weights.latency,100);assert.equal(app.configs[1].strategy.weights.price,0);
   assert.equal(app.configs[3].strategy.weights.price,1);
   assert.deepEqual(app.states[1],{candidate:2,count:1});assert.equal(migrateApp(app),false);
+});
+
+test('schema 9 lifts the price profile to a global setting and keeps the first one saved',()=>{
+  const app={schemaVersion:9,defaultStrategy:{mode:'price',usage:{inputRatio:100,cacheRate:50,measuredCache:false}},configs:[{keyId:1,strategy:{mode:'balanced',usage:{inputRatio:800}}}],states:{}};
+  assert.equal(migrateApp(app),true);assert.equal(app.schemaVersion,10);
+  assert.deepEqual(app.usage,{inputRatio:100,cacheRate:50,measuredCache:false});
+  assert.equal(app.defaultStrategy.usage,undefined);assert.equal(app.configs[0].strategy.usage,undefined);
+  const fallback={schemaVersion:9,configs:[{keyId:2,strategy:{mode:'price',usage:{inputRatio:800,cacheRate:40,measuredCache:true}}}],states:{}};
+  migrateApp(fallback);assert.equal(fallback.usage.inputRatio,800);assert.equal(fallback.usage.cacheRate,40);
+  assert.equal(migrateApp(fallback),false);
 });
 
 test('schema 8 latency/success keys with a percent improvement threshold switch to preview on upgrade',()=>{

@@ -1,6 +1,6 @@
-import {decide,platformPrice,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,DEFAULT_STRATEGY,INTERVAL} from './core.js';
+import {decide,platformPrice,reconcilePending,migrateApp,resetStrategyCheck,validateStrategy,validateUsage,DEFAULT_STRATEGY,INTERVAL} from './core.js';
 const ORIGIN='https://aihub.top', ALARM='aihub-check', PROVIDERS_URL='https://aihub.top/providers', AUTO_OPEN_GAP=600000;
-const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:9,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),account:null});
+const initial=()=>({configs:[],states:{},logs:[],notices:{},schemaVersion:10,checkMinutes:5,defaultStrategy:validateStrategy(DEFAULT_STRATEGY),usage:validateUsage(),account:null});
 let queue=Promise.resolve();
 const urgentPause=new Map();
 let disconnectRequested=false;
@@ -106,9 +106,17 @@ function catalogData(all,snapshot,usage){
   return {keys:all,models,at:Date.now()};
 }
 function errorText(e){return ({AUTH:'网站登录已失效，请打开平台并重新登录或刷新页面',NETWORK:'平台连接失败，将在下轮重试',FORBIDDEN:'平台拒绝请求，请检查登录状态或分组权限',FORMAT:'平台返回的数据无法识别，本轮未切换',STALE:'平台数据已过期或时间异常，本轮未切换，将在下轮重试',BUSINESS:'平台未确认操作成功，请检查后重试',HTTP:'平台服务异常，本轮停止',ACCOUNT:'当前账号与监控配置不一致',TAB_TIMEOUT:'读取已打开的 AIHub 页面超时，请刷新该页面后重试'})[e.message]||'检查未完成，本轮停止';}
-async function check(){
+// 手动检查：总是先连接平台，并把结果如实返回给设置页；定时检查仍只记录错误。
+async function check(manual=false){
+  await checkRun(manual);
+  if(!manual)return {ok:true};
   const app=await load();
-  if(!app.configs.some(c=>!c.paused) && !Object.values(app.states).some(s=>s.pending))return;
+  if(app.lastError)return {ok:false,error:app.lastError};
+  return {ok:true,note:app.configs.some(c=>!c.paused)?'':'已连接，当前没有运行中的监控'};
+}
+async function checkRun(manual=false){
+  const app=await load();
+  if(!manual && !app.configs.some(c=>!c.paused) && !Object.values(app.states).some(s=>s.pending))return;
   try{
     await connectedIdentity(app);
     const all=await keys();
@@ -126,7 +134,7 @@ async function check(){
     }
     await save(app);
     const snapshot=await authorizedSnapshot();
-    app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);
+    app.catalog=catalogData(all,snapshot,app.usage);
     if(snapshot.stale!==false || !(Date.now()-Date.parse(snapshot.generated_at)<=INTERVAL) || Date.parse(snapshot.generated_at)>Date.now()+60000)throw new Error('STALE');
     for(const c of app.configs){
       if(c.paused || waiting.has(c.keyId))continue;
@@ -135,7 +143,7 @@ async function check(){
       if(!k || k.status!=='active') {c.paused=true;await notice(app,`missing-${c.keyId}`,`Key ${c.keyId} 不存在或不可用，已暂停`);continue;}
       const previous=app.states[c.keyId]||{};
       const scoped={...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:k.maxRate}))};
-      const plan=decide({config:c,state:previous,currentGroupId:k.groupId,snapshot:scoped,intervalMs:(app.checkMinutes||5)*60000});
+      const plan=decide({config:c,state:previous,currentGroupId:k.groupId,snapshot:scoped,usage:app.usage,intervalMs:(app.checkMinutes||5)*60000});
       app.states[c.keyId]=plan.state;
       if(plan.externalChange)log(app,`Key ${c.keyId} 分组已变化，更新为 ${k.groupId}，下轮继续检查`);
       if(plan.notice)await notice(app,`${plan.notice}-${c.keyId}`,`Key ${c.keyId} 没有合格分组，保留当前分组`);
@@ -147,7 +155,7 @@ async function check(){
         if(!fresh || fresh.groupId!==k.groupId){if(fresh)plan.state.expectedGroupId=fresh.groupId;plan.state.candidate=null;plan.state.count=0;plan.state.status='切换前分组发生变化，等待下轮检查';continue;}
         // Health expires quickly (about 90 seconds in this HAR); re-evaluate before mutation.
         if(fresh.maxRate>0 && scoped.items.find(g=>g.group_id===plan.target)?.rate_multiplier>fresh.maxRate){plan.state.status='倍率上限发生变化，等待下轮';continue;}
-        const again=decide({config:c,state:previous,currentGroupId:fresh.groupId,snapshot:scoped,intervalMs:(app.checkMinutes||5)*60000});
+        const again=decide({config:c,state:previous,currentGroupId:fresh.groupId,snapshot:scoped,usage:app.usage,intervalMs:(app.checkMinutes||5)*60000});
         if(again.target!==plan.target){plan.state.status='切换前条件已变化，等下轮检查';continue;}
         plan.state.pending={from:k.groupId,to:plan.target,at:Date.now()};
         await save(app);
@@ -186,7 +194,7 @@ function dispatch(message){
 async function handle(message,pauseRequest,disconnectRequest){
   const app=await load();
   if(message.type==='state')return {app,connected:!!(await chrome.storage.session.get('auth')).auth};
-  if(message.type==='check'){await check();return {ok:true};}
+  if(message.type==='check')return await check(message.manual===true);
   if(message.type==='manualSwitch'){
     if(!Number.isSafeInteger(message.keyId)||!Number.isSafeInteger(message.target)||(message.expectedGroupId!==null&&!Number.isSafeInteger(message.expectedGroupId)))throw new Error('FORMAT');
     const c=app.configs.find(x=>x.keyId===message.keyId);if(!c)throw new Error('FORMAT');
@@ -203,12 +211,12 @@ async function handle(message,pauseRequest,disconnectRequest){
     if(current.groupId!==message.expectedGroupId)throw new Error('当前分组已变化，请重新检查后再切换');
     const snapshot=await authorizedSnapshot();
     snapshot.items=snapshot.items.map(g=>({...g,key_max_rate_multiplier:current.maxRate}));
-    const plan=decide({config:{...c,paused:false},currentGroupId:current.groupId,snapshot});
+    const plan=decide({config:{...c,paused:false},currentGroupId:current.groupId,snapshot,usage:app.usage});
     if(!plan.state.choices?.some(x=>x.id===message.target))throw new Error('目标已不符合筛选条件，请重新检查');
     if(current.groupId===message.target)return {ok:true};
     const latest=(await keys()).find(x=>x.id===c.keyId);
     if(!latest||latest.groupId!==current.groupId)throw new Error('当前分组已变化，请重新检查');
-    const confirmed=decide({config:{...c,paused:false},currentGroupId:latest.groupId,snapshot:{...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:latest.maxRate}))}});
+    const confirmed=decide({config:{...c,paused:false},currentGroupId:latest.groupId,snapshot:{...snapshot,items:snapshot.items.map(g=>({...g,key_max_rate_multiplier:latest.maxRate}))},usage:app.usage});
     if(!confirmed.state.choices?.some(x=>x.id===message.target))throw new Error('切换前条件已变化，请重新检查');
     if(disconnectRequested)throw new Error('已断开连接，手动切换已取消');
     c.paused=true;
@@ -235,7 +243,7 @@ async function handle(message,pauseRequest,disconnectRequest){
       await openProvidersIfAllowed(fresh,e);
       if(fresh.lastAutoOpenAt!==before)await save(fresh);
       throw e;
-    }app.catalog=catalogData(all,snapshot,app.defaultStrategy.usage);await save(app);
+    }app.catalog=catalogData(all,snapshot,app.usage);await save(app);
     return app.catalog;
   }
   if(message.type==='configure'){
@@ -258,10 +266,13 @@ async function handle(message,pauseRequest,disconnectRequest){
   }
   if(message.type==='strategy'){
     app.defaultStrategy=validateStrategy(message.strategy);
+    const usageChanged=message.usage!=null && JSON.stringify(validateUsage(message.usage))!==JSON.stringify(app.usage);
+    if(message.usage!=null)app.usage=validateUsage(message.usage);
     const intervalChanged=message.checkMinutes!=null && message.checkMinutes!==(app.checkMinutes||5);
     if(message.checkMinutes!=null){if(!Number.isInteger(message.checkMinutes)||message.checkMinutes<1||message.checkMinutes>60)throw new Error('检查间隔须为1–60分钟的整数');app.checkMinutes=message.checkMinutes;}
-    if(intervalChanged)for(const s of Object.values(app.states))resetStrategyCheck(s,'检查间隔已更新，等待检查');
-    log(app,'已更新新建 Key 的默认策略及检查间隔');await save(app);await ensureAlarm();return {ok:true};
+    // A new price profile changes every key's ranking, so confirmation starts over.
+    if(intervalChanged||usageChanged)for(const s of Object.values(app.states))resetStrategyCheck(s,usageChanged?'价格计算已更新，等待检查':'检查间隔已更新，等待检查');
+    log(app,'已更新新建 Key 的默认策略、价格计算及检查间隔');await save(app);await ensureAlarm();return {ok:true};
   }
   if(message.type==='keyStrategy'||message.type==='toggleKey'){
     const c=app.configs.find(x=>x.keyId===message.keyId);if(!c)throw new Error('FORMAT');

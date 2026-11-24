@@ -1,4 +1,4 @@
-import {validateStrategy,strategyLabel,providerBadgeDetails,presetWeights} from './core.js';
+import {validateStrategy,validateUsage,strategyLabel,providerBadgeDetails,presetWeights} from './core.js';
 const $=id=>document.getElementById(id);
 let catalog={keys:[],models:[]},app,globalLoaded=false;
 let appliedCatalogAt=0,connected=false;
@@ -33,7 +33,6 @@ function attachStrategyFields(form,strategy){
   let custom={...s.weights};
   const fillWeights=mode=>{const w=presetWeights(mode,custom);for(const key of weightInputs)fields[key].value=w[key];};
   fillWeights(s.mode);
-  fields.inputRatio.value=s.usage.inputRatio;fields.cacheRate.value=s.usage.cacheRate;fields.measuredCache.checked=s.usage.measuredCache;
   form.addEventListener('change',event=>{if(event.target.name==='mode')fillWeights(event.target.value);});
   form.addEventListener('input',event=>{
     if(!weightInputs.includes(event.target.name))return;
@@ -49,8 +48,7 @@ function readEditor(form,requireDetection,original){
     rules[key]=value?value.split(/[\s,，]+/).map(Number):[];
   }
   const weights=mode==='weighted'?Object.fromEntries(weightInputs.map(key=>[key,Number(fields[key].value)])):original?.weights;
-  const usage={inputRatio:Number(fields.inputRatio.value),cacheRate:Number(fields.cacheRate.value),measuredCache:fields.measuredCache.checked};
-  return validateStrategy({mode,rules,requireDetection,weights,usage});
+  return validateStrategy({mode,rules,requireDetection,weights});
 }
 function keyStrategyEditor(config){
   const form=node('form',null,'key-strategy-editor');
@@ -71,8 +69,8 @@ function keyStrategyEditor(config){
   };
   return form;
 }
-function priceProfileText(strategy){
-  const u=validateStrategy(strategy).usage;
+function priceProfileText(usage){
+  const u=validateUsage(usage);
   return `模型价格按输入:输出 ${u.inputRatio}:1 计算，缓存命中率${u.measuredCache?`优先用渠道实测值，无实测时按 ${u.cacheRate}%`:`固定按 ${u.cacheRate}%`}。`;
 }
 const format=(value,fn)=>value==null?'未知':fn(value);
@@ -219,6 +217,8 @@ async function refresh(){
     defaultEditor.elements.requireDetection.checked=app.defaultStrategy.requireDetection!==false;
     $('checkMinutes').value=app.checkMinutes||5;
     $('autoOpenProviders').checked=app.autoOpenProviders===true;
+    const usage=$('usageForm').elements;
+    usage.inputRatio.value=app.usage.inputRatio;usage.cacheRate.value=app.usage.cacheRate;usage.measuredCache.checked=app.usage.measuredCache;
     globalLoaded=true;
   }
   for(const keyId of strategyEditors.keys())if(!app.configs.some(c=>c.keyId===keyId))strategyEditors.delete(keyId);
@@ -238,7 +238,7 @@ async function refresh(){
     box.append(keyHeader(c.keyId,keyById.get(c.keyId),c,s),node('p',`${c.paused?'已暂停':c.automatic?'自动切换':'仅预览'} · ${s.status||'等待检查'}`,'monitor-status'),node('p',`${groupText} · ${strategyLabel(c.strategy)}`,'monitor-meta'));
     const current=s.choices?.find(x=>x.id===s.expectedGroupId);
     if(current){const summary=node('div',null,'current-summary'),price=node('span',current.cost==null?'模型价格未知':'$'+current.cost.toFixed(6),'price');if(current.cost!=null)price.append(node('small',' /M'));summary.append(node('span','当前渠道','eyebrow'),node('span',current.code,'channel'),price);box.append(summary);}
-    if(Array.isArray(s.choices)){const details=node('details',null,'candidate-details');details.open=expandedCandidates.has(c.keyId);details.addEventListener('toggle',()=>{if(details.open)expandedCandidates.add(c.keyId);else expandedCandidates.delete(c.keyId);});details.append(node('summary',`合格候选 · ${s.choices.length} 个`));if(s.choices.length)details.append(candidateTable(c,s),node('p',priceProfileText(c.strategy)+' 显示排序不影响自动策略。手动切换会重新验证资格，并暂停此 key 的自动选择。','muted'));else details.append(node('p','当前没有符合筛选条件的渠道。展开下方“未参与比较”查看原因；下轮检查会重新评估。','muted'));box.append(details);}
+    if(Array.isArray(s.choices)){const details=node('details',null,'candidate-details');details.open=expandedCandidates.has(c.keyId);details.addEventListener('toggle',()=>{if(details.open)expandedCandidates.add(c.keyId);else expandedCandidates.delete(c.keyId);});details.append(node('summary',`合格候选 · ${s.choices.length} 个`));if(s.choices.length)details.append(candidateTable(c,s),node('p',priceProfileText(app.usage)+' 显示排序不影响自动策略。手动切换会重新验证资格，并暂停此 key 的自动选择。','muted'));else details.append(node('p','当前没有符合筛选条件的渠道。展开下方“未参与比较”查看原因；下轮检查会重新评估。','muted'));box.append(details);}
     if(s.excluded&&Object.keys(s.excluded).length){
       const details=node('details',null,'exclusions'),list=node('div',null,'exclusion-list');
       details.open=expandedExclusions.has(c.keyId);
@@ -310,7 +310,10 @@ $('catalog').onclick=$('refreshCatalog').onclick=()=>act(async()=>{catalog=await
 $('disconnect').onclick=()=>confirmAction('确认断开并暂停',['将断开平台连接并暂停全部监控。'],'确认断开',{type:'disconnect'});
 $('resetAccount').onclick=()=>confirmAction('确认清空账号绑定',['移除全部监控后，可清空保存的账号绑定并连接其他账号。'],'确认清空',{type:'resetAccount'});
 $('autoOpenProviders').onchange=event=>act(()=>send({type:'autoOpen',enabled:event.target.checked}));
-$('check').onclick=()=>act(()=>send({type:'check'}));
+$('check').onclick=()=>act(async()=>{const r=await send({type:'check',manual:true});if(r&&r.ok===false)throw new Error(r.error||'检查失败');if(r&&r.note)$('message').textContent=r.note;});
+$('usageForm').onsubmit=event=>{event.preventDefault();const f=event.target.elements;
+  act(async()=>{await send({type:'strategy',strategy:app.defaultStrategy,usage:{inputRatio:Number(f.inputRatio.value),cacheRate:Number(f.cacheRate.value),measuredCache:f.measuredCache.checked}});
+    globalLoaded=false;});};
 defaultEditor.onsubmit=event=>{event.preventDefault();act(()=>send({type:'strategy',strategy:readEditor(defaultEditor,defaultEditor.elements.requireDetection.checked,app.defaultStrategy),checkMinutes:Number($('checkMinutes').value)}));};
 refresh().then(()=>{if(connected&&!catalog.keys.length)$('refreshCatalog').click();}).catch(e=>$('message').textContent=e.message);
 setInterval(()=>{if(!document.querySelector('dialog[open]')&&!document.activeElement?.matches('input,select'))refresh().catch(()=>{});},20000);
